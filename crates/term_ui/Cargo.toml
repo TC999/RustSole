@@ -1,0 +1,11 @@
+[package]
+name = "term_ui"
+version.workspace = true
+edition.workspace = true
+
+[dependencies]
+term_core.workspace = true
+term_config.workspace = true
+term_platform.workspace = true
+gpui.workspace = true
+alacritty_terminal.workspace = true

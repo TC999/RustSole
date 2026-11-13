@@ -1,0 +1,10 @@
+[package]
+name = "app"
+version.workspace = true
+edition.workspace = true
+
+[dependencies]
+term_ui.workspace = true
+term_core.workspace = true
+term_config.workspace = true
+gpui.workspace = true

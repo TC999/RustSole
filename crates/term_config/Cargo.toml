@@ -1,0 +1,6 @@
+[package]
+name = "term_config"
+version.workspace = true
+edition.workspace = true
+
+[dependencies]
