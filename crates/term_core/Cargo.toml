@@ -1,0 +1,8 @@
+[package]
+name = "term_core"
+version.workspace = true
+edition.workspace = true
+
+[dependencies]
+term_platform.workspace = true
+alacritty_terminal.workspace = true

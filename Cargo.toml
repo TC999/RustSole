@@ -1,6 +1,24 @@
-[package]
-name = "RustSole"
+# RustSole workspace:crates 依赖方向见 docs/ai/ARCHITECTURE.md
+[workspace]
+resolver = "2"
+members = [
+    "crates/term_platform",
+    "crates/term_core",
+    "crates/term_config",
+    "crates/term_ui",
+    "crates/app",
+]
+
+[workspace.package]
 version = "0.1.0"
 edition = "2021"
 
-[dependencies]
+[workspace.dependencies]
+term_platform = { path = "crates/term_platform" }
+term_core = { path = "crates/term_core" }
+term_config = { path = "crates/term_config" }
+term_ui = { path = "crates/term_ui" }
+# 已核实:crates.io 上 gpui 最新稳定版 0.2.2(2025-10-22 发布,zed-industries/zed)
+gpui = "0.2.2"
+# 已核实:crates.io 上 alacritty_terminal 最新稳定版 0.26.0(2026-04-06 发布)
+alacritty_terminal = "0.26.0"
