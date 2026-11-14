@@ -34,6 +34,8 @@ pub mod terminal {
     pub const SCROLLBAR_TRACK: u32 = 0x181818;
     /// 滚动条 thumb 常态色。
     pub const SCROLLBAR_THUMB: u32 = 0x555555;
+    /// 选区高亮底色(以半透明叠加在单元格背景上,见 view::paint_selection)。
+    pub const SELECTION_BG: u32 = 0x4a6d8c;
 }
 
 /// 标题栏高度(px)。与窗口控制按钮宽度一致时按钮是正方形热区。

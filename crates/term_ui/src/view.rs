@@ -1,24 +1,32 @@
 //! 终端视图:单窗口单终端(阶段 1)。
 //! 输入采集与渲染在这里;快照提取在锁内、绘制在锁外(ARCHITECTURE.md 不变量 2/8)。
 
+use std::cell::Cell;
 use std::rc::Rc;
 use std::sync::Arc;
 
 use gpui::prelude::*;
 use gpui::{
     canvas, div, fill, font, px, relative, rgb, size, App, Bounds, ClickEvent, Context,
-    ElementInputHandler, Entity, EntityInputHandler, FocusHandle, Focusable, IntoElement,
-    KeyDownEvent, MouseButton, MouseDownEvent, MouseMoveEvent, Pixels, Point, Render, ScrollDelta,
-    ScrollWheelEvent, SharedString, UTF16Selection, Window,
+    DispatchPhase, ElementInputHandler, Entity, EntityInputHandler, FocusHandle, Focusable,
+    IntoElement, KeyDownEvent, MouseButton, MouseDownEvent, MouseMoveEvent, MouseUpEvent, Pixels,
+    Point, Render, ScrollDelta, ScrollWheelEvent, SharedString, UTF16Selection, Window,
 };
 
 use alacritty_terminal::grid::{Dimensions as _, Scroll};
+use alacritty_terminal::index::{Column, Line, Point as TermPoint, Side};
+use alacritty_terminal::selection::{Selection, SelectionType};
+use alacritty_terminal::term::TermMode;
 
 use term_core::key::{encode_key, KeyState};
+use term_core::paste::sanitize_paste;
 use term_core::proxy::TermEventMsg;
+use term_core::selection::SelectionBuffer;
 use term_core::session::Session;
 
+use crate::buffer;
 use crate::grid::{ratio_to_offset, snapshot, thumb_ratio, GridSnapshot};
+use crate::selection::{terminal_handles_mouse, DragAnchor, GridGeometry};
 use crate::theme::{terminal, window as window_theme, WindowControl, WindowControlsShown};
 use crate::titlebar::{render_titlebar, TitlebarHandlers, TitlebarModel};
 
@@ -70,6 +78,14 @@ pub struct TerminalView {
     hovered_control: Option<WindowControl>,
     /// 窗口激活状态观察者(首次 render 时注册,见 render 中的说明)。
     activation_subscription: Option<gpui::Subscription>,
+    /// 选区缓冲。首次 render 时从全局取共享实例(SEL-007),之后复用。
+    selection_buffer: Option<Arc<SelectionBuffer>>,
+    /// 左键拖选的锚点;None 表示当前没有拖选进行中。
+    drag_anchor: Option<DragAnchor>,
+    /// 终端画布在视口中的左上角(逻辑像素),每次绘制时由 canvas 回填。
+    /// 鼠标事件给的是视口坐标,换算单元格必须减去这个偏移。
+    /// 用 `Cell` 而不是字段直接赋值:paint 闭包只拿到共享引用,不能改视图字段。
+    canvas_origin: Rc<Cell<(f32, f32)>>,
 }
 
 impl TerminalView {
@@ -84,8 +100,11 @@ impl TerminalView {
         let session = Session::new(cols, rows)
             .map_err(|e| gpui::private::anyhow::anyhow!("启动终端会话失败: {e}"))?;
 
+        // SEL-007:选区缓冲全局共享。保证全局实例存在(应用入口也会调用,这里是兜底)。
+        buffer::init(cx);
+
         let focus = cx.focus_handle();
-        let view = cx.new(|_| Self {
+        let view = cx.new(|cx| Self {
             session,
             focus,
             cols,
@@ -102,10 +121,14 @@ impl TerminalView {
                 rows_runs: Vec::new(),
                 cursor: None,
                 display_offset: 0,
+                selection: Vec::new(),
             }),
             title: SharedString::from("RustSole"),
             hovered_control: None,
             activation_subscription: None,
+            selection_buffer: buffer::shared(cx),
+            drag_anchor: None,
+            canvas_origin: Rc::new(Cell::new((0.0, 0.0))),
         });
 
         // 事件驱动重绘:后台任务把 PTY 事件合并后唤醒主线程(不变量 4:约 8ms 合并)
@@ -470,6 +493,243 @@ impl TerminalView {
             cx.notify();
         }
     }
+
+    /// 选区缓冲(全局共享,SEL-007)。全局实例缺失时退回视图私有实例,
+    /// 保证功能不因初始化顺序而失效(此时跨窗口共享不成立,属于降级)。
+    fn selection_buffer(&mut self) -> Arc<SelectionBuffer> {
+        if let Some(buffer) = &self.selection_buffer {
+            return Arc::clone(buffer);
+        }
+        let buffer = Arc::new(SelectionBuffer::new());
+        self.selection_buffer = Some(Arc::clone(&buffer));
+        buffer
+    }
+
+    /// 视口坐标 → 单元格(栅格坐标)。
+    ///
+    /// 画布左上角由 canvas prepaint 回填;行列数用视图当前网格尺寸。
+    /// 返回值的行号已换算成 grid 行(减去回看偏移)。
+    fn cell_from_position(&self, position: Point<Pixels>) -> Option<DragAnchor> {
+        let (origin_x, origin_y) = self.canvas_origin.get();
+        let geometry = GridGeometry {
+            origin_x,
+            origin_y,
+            cell_width: self.cell_width,
+            cell_height: CELL_HEIGHT,
+            rows: self.rows as usize,
+            cols: self.cols as usize,
+        };
+        let point = geometry.cell_at(f32::from(position.x), f32::from(position.y))?;
+        // 回看历史时,视口顶行对应 grid 的 Line(-display_offset)
+        let offset = { self.session.term.lock().grid().display_offset() as i32 };
+        Some(DragAnchor {
+            line: point.row as i32 - offset,
+            col: point.col,
+            side_left: point.side_left,
+        })
+    }
+
+    /// 鼠标按下:左键开始拖选(SEL-001),中键粘贴选区缓冲(SEL-002)。
+    fn handle_mouse_down(
+        &mut self,
+        event: &MouseDownEvent,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
+        // 点击终端要收回键盘焦点,否则选区后键盘输入落到别处
+        self.focus.focus(window);
+
+        // MOUSE-001/002:程序接管鼠标时终端不抢事件;Shift 强制由终端处理
+        let mouse_reporting = {
+            let term = self.session.term.lock();
+            term.mode().intersects(TermMode::MOUSE_MODE)
+        };
+        if !terminal_handles_mouse(mouse_reporting, event.modifiers.shift) {
+            return;
+        }
+
+        match event.button {
+            MouseButton::Left => {
+                let Some(anchor) = self.cell_from_position(event.position) else {
+                    return;
+                };
+                self.drag_anchor = Some(anchor);
+                {
+                    let mut term = self.session.term.lock();
+                    // 开始新的选择:旧高亮立即消失(缓冲内容保持不变)
+                    term.selection = Some(Selection::new(
+                        SelectionType::Simple,
+                        TermPoint::new(Line(anchor.line), Column(anchor.col)),
+                        side_of(anchor.side_left),
+                    ));
+                }
+                self.refresh_snapshot();
+                cx.notify();
+            }
+            MouseButton::Middle => self.paste_selection_buffer(cx),
+            _ => {}
+        }
+    }
+
+    /// 鼠标移动:拖动中把选区末端移到当前单元格。
+    fn handle_mouse_move(&mut self, event: &MouseMoveEvent, cx: &mut Context<Self>) {
+        if self.drag_anchor.is_none() {
+            return;
+        }
+        // 左键已松开但没收到 mouse_up(例如在窗口外松开):结束拖选
+        if event.pressed_button != Some(MouseButton::Left) {
+            self.drag_anchor = None;
+            return;
+        }
+        let Some(end) = self.cell_from_position(event.position) else {
+            return;
+        };
+        {
+            let mut term = self.session.term.lock();
+            if let Some(selection) = term.selection.as_mut() {
+                selection.update(
+                    TermPoint::new(Line(end.line), Column(end.col)),
+                    side_of(end.side_left),
+                );
+            }
+        }
+        self.refresh_snapshot();
+        cx.notify();
+    }
+
+    /// 鼠标抬起:左键抬起时把选中文本写入选区缓冲(SEL-001)。
+    ///
+    /// 空选区不覆盖已有内容(SEL-004)。
+    fn handle_mouse_up(&mut self, event: &MouseUpEvent, cx: &mut Context<Self>) {
+        if event.button != MouseButton::Left || self.drag_anchor.take().is_none() {
+            return;
+        }
+        let text = {
+            let term = self.session.term.lock();
+            term.selection_to_string()
+        };
+        // 锁已释放:写缓冲不属于终端状态
+        if let Some(text) = text {
+            if !text.is_empty() {
+                self.selection_buffer().set(text);
+            }
+        }
+        cx.notify();
+    }
+
+    /// 中键粘贴选区缓冲(SEL-002):与剪贴板粘贴共用同一个清洗函数(PASTE-*)。
+    fn paste_selection_buffer(&mut self, cx: &mut Context<Self>) {
+        let Some(text) = self.selection_buffer().get() else {
+            // 缓冲为空:不发送任何字节(发送空输入会让终端挂起)
+            return;
+        };
+        let bracketed = {
+            let term = self.session.term.lock();
+            term.mode().contains(TermMode::BRACKETED_PASTE)
+        };
+        let payload = sanitize_paste(&text, bracketed);
+        self.session.write(payload.as_bytes());
+        cx.notify();
+    }
+}
+
+/// 注册窗口级鼠标监听(选区与中键粘贴)。
+///
+/// 不用元素级 `on_mouse_down/on_mouse_move`:元素级监听带 `hitbox.is_hovered` 过滤,
+/// 拖到画布外就收不到移动事件,选区无法延伸到边缘。窗口级监听只按
+/// `bounds` 与当前拖选状态自行过滤,语义更贴近终端。
+fn register_mouse_handlers(
+    window: &mut Window,
+    bounds: Bounds<Pixels>,
+    entity: Entity<TerminalView>,
+) {
+    // 按下:仅限画布区域(避免点滚动条/标题栏时误粘贴或误开选区)
+    let down_bounds = bounds;
+    let down_entity = entity.clone();
+    window.on_mouse_event(move |event: &MouseDownEvent, phase, window, cx| {
+        if phase != DispatchPhase::Bubble || !down_bounds.contains(&event.position) {
+            return;
+        }
+        down_entity.update(cx, |view, cx| {
+            view.handle_mouse_down(event, window, cx);
+        });
+    });
+
+    // 移动:拖选进行中才处理;指针离开画布时由 gpui 的 SetCapture 继续投递
+    let move_bounds = bounds;
+    let move_entity = entity.clone();
+    window.on_mouse_event(move |event: &MouseMoveEvent, phase, _window, cx| {
+        if phase != DispatchPhase::Bubble {
+            return;
+        }
+        move_entity.update(cx, |view, cx| {
+            if view.drag_anchor.is_none() {
+                return;
+            }
+            // 拖出画布时把位置钳制到画布边缘(选区延伸到边界,不越界)
+            let clamped = Point::new(
+                event.position.x.max(move_bounds.origin.x),
+                event.position.y.max(move_bounds.origin.y),
+            );
+            let clamped = Point::new(
+                clamped.x.min(move_bounds.origin.x + move_bounds.size.width),
+                clamped
+                    .y
+                    .min(move_bounds.origin.y + move_bounds.size.height),
+            );
+            let synthetic = MouseMoveEvent {
+                position: clamped,
+                pressed_button: event.pressed_button,
+                modifiers: event.modifiers,
+            };
+            view.handle_mouse_move(&synthetic, cx);
+        });
+    });
+
+    // 抬起:拖选完成时写选区缓冲
+    window.on_mouse_event(move |event: &MouseUpEvent, phase, _window, cx| {
+        if phase != DispatchPhase::Bubble {
+            return;
+        }
+        entity.update(cx, |view, cx| {
+            view.handle_mouse_up(event, cx);
+        });
+    });
+}
+
+/// 画选区高亮:按快照里的每行列区间画半透明矩形。
+///
+/// 画在背景块之后、文本之前:覆盖背景但不影响文字可读性,也不需要把文本 run
+/// 再按选中状态切分(宽字符列与文本列的对齐问题保持与既有渲染一致)。
+fn paint_selection(
+    snapshot: &GridSnapshot,
+    cell_width: f32,
+    bounds: Bounds<Pixels>,
+    window: &mut Window,
+) {
+    for (row, span) in snapshot.selection.iter().enumerate() {
+        let Some((start, end)) = span else {
+            continue;
+        };
+        if end < start {
+            continue;
+        }
+        let x = bounds.origin.x + px(*start as f32 * cell_width);
+        let y = bounds.origin.y + px(row as f32 * CELL_HEIGHT);
+        let width = px((end - start + 1) as f32 * cell_width);
+        let quad = Bounds::new(Point::new(x, y), size(width, px(CELL_HEIGHT)));
+        let color: gpui::Hsla = rgb(terminal::SELECTION_BG).into();
+        window.paint_quad(fill(quad, color.opacity(0.35)));
+    }
+}
+
+/// 单元格半侧 → alacritty 的选择端点方向。
+fn side_of(side_left: bool) -> Side {
+    if side_left {
+        Side::Left
+    } else {
+        Side::Right
+    }
 }
 
 impl Focusable for TerminalView {
@@ -507,6 +767,9 @@ impl Render for TerminalView {
         let focus = self.focus.clone();
         let cell_width = self.cell_width;
         let this = cx.entity();
+        // 鼠标事件监听注册在绘制阶段(Window::on_mouse_event 的约束),
+        // 闭包只能拿共享引用,因此画布原点通过 Rc<Cell<_>> 共享给 paint 与鼠标回调。
+        let canvas_origin = Rc::clone(&self.canvas_origin);
 
         let titlebar = render_titlebar(
             &TitlebarModel {
@@ -576,15 +839,24 @@ impl Render for TerminalView {
                         // 否则 canvas 会按整行宽度布局,把滚动条挤出可视区。
                         div().flex_1().h_full().child(
                             canvas(
-                                |_bounds, _window, _cx| {},
-                                move |bounds, (), window, cx| {
+                                move |bounds, _window, _cx| {
+                                    // 画布原点供鼠标坐标换算:视图字段在绘制闭包里拿不到
+                                    // 可变引用,走共享 Cell 回填。
+                                    (f32::from(bounds.origin.x), f32::from(bounds.origin.y))
+                                },
+                                move |bounds, origin, window, cx| {
+                                    canvas_origin.set(origin);
                                     // 注册 IME 输入处理器(paint 阶段必须;焦点在终端时平台才会投递组合文本)
                                     window.handle_input(
                                         &focus,
-                                        ElementInputHandler::new(bounds, this),
+                                        ElementInputHandler::new(bounds, this.clone()),
                                         cx,
                                     );
                                     paint_grid(&snapshot, cell_width, bounds, window, cx);
+                                    // 选区与中键粘贴用窗口级监听:按下后指针离开画布
+                                    // (gpui 在按下时已 SetCapture)仍要收到移动与抬起,
+                                    // 元素级 on_mouse_move 的 is_hovered 过滤会漏掉这些事件。
+                                    register_mouse_handlers(window, bounds, this.clone());
                                 },
                             )
                             .size_full(),
@@ -695,22 +967,32 @@ fn paint_grid(
 
     let font_family = term_platform::platform_info().default_font_family;
 
+    // 第一遍:所有非默认背景块。必须排在选区之前,否则程序设置的背景色会盖住高亮;
+    // 文本必须排在选区之后,否则高亮会压暗文字。
+    for (row_idx, runs) in snapshot.rows_runs.iter().enumerate() {
+        let y = bounds.origin.y + px(row_idx as f32 * CELL_HEIGHT);
+        for run in runs {
+            if run.style.bg == crate::grid::DEFAULT_BG {
+                continue;
+            }
+            let x = bounds.origin.x + px(run.start_col as f32 * cell_width);
+            let width = px(run.text.chars().count() as f32 * cell_width);
+            let bg_bounds = Bounds::new(Point::new(x, y), size(width, px(CELL_HEIGHT)));
+            window.paint_quad(fill(
+                bg_bounds,
+                rgb((run.style.bg[0] as u32) << 16
+                    | (run.style.bg[1] as u32) << 8
+                    | (run.style.bg[2] as u32)),
+            ));
+        }
+    }
+
+    paint_selection(snapshot, cell_width, bounds, window);
+
     for (row_idx, runs) in snapshot.rows_runs.iter().enumerate() {
         let y = bounds.origin.y + px(row_idx as f32 * CELL_HEIGHT);
         for run in runs {
             let x = bounds.origin.x + px(run.start_col as f32 * cell_width);
-            let width = px(run.text.chars().count() as f32 * cell_width);
-
-            // 背景色块(仅当非默认背景时画)
-            if run.style.bg != crate::grid::DEFAULT_BG {
-                let bg_bounds = Bounds::new(Point::new(x, y), size(width, px(CELL_HEIGHT)));
-                window.paint_quad(fill(
-                    bg_bounds,
-                    rgb((run.style.bg[0] as u32) << 16
-                        | (run.style.bg[1] as u32) << 8
-                        | run.style.bg[2] as u32),
-                ));
-            }
 
             // 文本 run(TextRun.font 是 gpui::Font,颜色需要 Hsla)
             let text_run = gpui::TextRun {

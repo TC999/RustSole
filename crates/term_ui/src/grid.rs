@@ -9,6 +9,8 @@ use alacritty_terminal::vte::ansi::{Color, NamedColor};
 
 use term_core::proxy::ChannelListener;
 
+use crate::selection::SelectionSpan;
+
 /// 单元格样式(简化子集,渲染用)。
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct CellStyle {
@@ -46,6 +48,9 @@ pub struct GridSnapshot {
     pub cursor: Option<(usize, usize)>,
     /// 当前显示偏移(回看的历史行数;0 = 显示最新内容)。
     pub display_offset: usize,
+    /// 每行被选中的列区间(含首尾),下标与 `rows_runs` 对齐;未选中的行为 `None`。
+    /// 在锁内算好,绘制时不再访问 Term(不变量 2)。
+    pub selection: Vec<Option<(usize, usize)>>,
 }
 
 /// 调色板:16 色 + 前景/背景。默认值取自常见 xterm 配色(阶段 1 无配置系统)。
@@ -213,7 +218,36 @@ pub fn snapshot(term: &Term<ChannelListener>) -> GridSnapshot {
         rows_runs,
         cursor,
         display_offset: grid.display_offset(),
+        selection: selection_rows(term, top_line, rows, cols),
     }
+}
+
+/// 把 Term 里的选区换算成"每行的列区间"(视口坐标,下标与快照行对齐)。
+///
+/// 必须在锁内调用。用 alacritty 自己的 `to_range` 做端点修正(端点落在单元格
+/// 右半侧时排除该列等),避免在 UI 层重复实现一遍它的边界规则。
+fn selection_rows(
+    term: &Term<ChannelListener>,
+    top_line: i32,
+    rows: usize,
+    cols: usize,
+) -> Vec<Option<(usize, usize)>> {
+    let mut per_row = vec![None; rows];
+    // 选区为空(单击未拖动)或不在可视区:全部按未选中处理
+    let Some(range) = term.selection.as_ref().and_then(|s| s.to_range(term)) else {
+        return per_row;
+    };
+    let span = SelectionSpan {
+        start_line: range.start.line.0,
+        start_col: range.start.column.0,
+        end_line: range.end.line.0,
+        end_col: range.end.column.0,
+        is_block: range.is_block,
+    };
+    for (row, slot) in per_row.iter_mut().enumerate() {
+        *slot = span.cols_on_line(top_line + row as i32, cols);
+    }
+    per_row
 }
 
 /// 滚动条 thumb 位置(0..1)与显示偏移的映射。
