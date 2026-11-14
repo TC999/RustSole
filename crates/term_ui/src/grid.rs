@@ -215,3 +215,88 @@ pub fn snapshot(term: &Term<ChannelListener>) -> GridSnapshot {
         display_offset: grid.display_offset(),
     }
 }
+
+/// 滚动条 thumb 位置(0..1)与显示偏移的映射。
+///
+/// 语义基准(实测确认):
+/// - display_offset = 0 表示显示**最新**内容 → thumb 应贴在轨道**底部**;
+/// - display_offset = history 表示回看到**最旧**内容 → thumb 贴在轨道**顶部**。
+///
+/// 因此 thumb 比例 = 1 - offset / history,与 offset 成**反比**。
+pub fn thumb_ratio(display_offset: usize, history: usize) -> f32 {
+    if history == 0 {
+        return 1.0;
+    }
+    let offset = display_offset.min(history) as f32;
+    1.0 - offset / history as f32
+}
+
+/// 滚动条轨道位移(0..1,0 = 轨道顶)换算回 display_offset。
+///
+/// 与 [thumb_ratio] 互逆:轨道顶(0.0)→ offset = history(最旧);
+/// 轨道底(1.0)→ offset = 0(最新)。
+pub fn ratio_to_offset(ratio: f32, history: usize) -> usize {
+    if history == 0 {
+        return 0;
+    }
+    let r = ratio.clamp(0.0, 1.0);
+    ((1.0 - r) * history as f32).round() as usize
+}
+
+#[cfg(test)]
+mod scrollbar_tests {
+    use super::*;
+
+    /// 无历史:thumb 贴底(最新内容)
+    #[test]
+    fn no_history_thumb_at_bottom() {
+        assert_eq!(thumb_ratio(0, 0), 1.0);
+        assert_eq!(ratio_to_offset(1.0, 0), 0);
+    }
+
+    /// offset=0(最新)→ thumb 在底部;offset=history(最旧)→ thumb 在顶部
+    #[test]
+    fn thumb_position_is_inverse_of_offset() {
+        assert_eq!(thumb_ratio(0, 100), 1.0);
+        assert_eq!(thumb_ratio(100, 100), 0.0);
+        assert_eq!(thumb_ratio(50, 100), 0.5);
+    }
+
+    /// 轨道顶对应最旧内容,轨道底对应最新内容
+    #[test]
+    fn ratio_maps_back_to_offset() {
+        assert_eq!(ratio_to_offset(0.0, 100), 100);
+        assert_eq!(ratio_to_offset(1.0, 100), 0);
+        assert_eq!(ratio_to_offset(0.5, 100), 50);
+    }
+
+    /// 两个方向互逆
+    #[test]
+    fn roundtrip_is_identity() {
+        for offset in [0, 1, 37, 99, 100] {
+            let r = thumb_ratio(offset, 100);
+            assert_eq!(ratio_to_offset(r, 100), offset);
+        }
+    }
+
+    /// 向下拖动 thumb(比例增大)→ offset 变小 → 趋向最新内容(与鼠标移动方向一致)
+    #[test]
+    fn dragging_down_moves_toward_latest() {
+        // 起始在中间
+        let start = 0.5_f32;
+        assert_eq!(ratio_to_offset(start, 100), 50);
+        // 鼠标向下拖 → 比例变大
+        assert_eq!(ratio_to_offset(0.6, 100), 40);
+        assert!(ratio_to_offset(0.6, 100) < ratio_to_offset(start, 100));
+        // 鼠标向上拖 → 比例变小 → offset 变大(更旧)
+        assert_eq!(ratio_to_offset(0.4, 100), 60);
+    }
+
+    /// 越界输入被钳制
+    #[test]
+    fn clamps_out_of_range() {
+        assert_eq!(ratio_to_offset(-5.0, 100), 100);
+        assert_eq!(ratio_to_offset(5.0, 100), 0);
+        assert_eq!(thumb_ratio(200, 100), 0.0);
+    }
+}

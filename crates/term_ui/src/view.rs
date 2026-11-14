@@ -17,7 +17,7 @@ use term_core::key::{encode_key, KeyState};
 use term_core::proxy::TermEventMsg;
 use term_core::session::Session;
 
-use crate::grid::{snapshot, GridSnapshot};
+use crate::grid::{ratio_to_offset, snapshot, thumb_ratio, GridSnapshot};
 
 /// 单元格像素尺寸(阶段 1 固定值,随 HiDPI 缩放由 GPUI 处理)。
 pub const CELL_WIDTH: f32 = 8.0;
@@ -26,6 +26,9 @@ pub const FONT_SIZE: f32 = 14.0;
 
 /// 滚动条轨道宽度(px)。
 pub const SCROLLBAR_WIDTH: f32 = 10.0;
+
+/// thumb 高度占轨道高度的比例(阶段 1 固定值;未按内容比例动态计算)。
+pub const THUMB_RATIO: f32 = 0.15;
 
 /// 滚动条拖动状态。grab_y 是按下时相对滚动条轨道顶部的 y(px),
 /// grab_offset 是按下时 thumb 对应的 display_offset,保证拖动不跳变。
@@ -211,9 +214,14 @@ impl TerminalView {
                 grab_offset: self.display_offset_value(),
             });
         } else {
-            // 点在轨道空白:跳转到对应历史位置
-            let target = (relative / track_height) * history as f32;
-            self.set_display_offset(target.floor() as i32, cx);
+            // 点在轨道空白:按轨道位置跳转(轨道底 = 最新内容)
+            let ratio = if track_height > 0.0 {
+                relative / track_height
+            } else {
+                1.0
+            };
+            let target = ratio_to_offset(ratio, history);
+            self.set_display_offset(target as i32, cx);
         }
     }
 
@@ -227,8 +235,10 @@ impl TerminalView {
         let dy = y_px - drag.grab_y;
         // thumb 在轨道上的可移动跨度
         let thumb_span = (track_height - thumb_height).max(1.0);
-        let delta_ratio = dy / thumb_span;
-        let target = (drag.grab_offset + delta_ratio * history as f32)
+        // 鼠标向下移动(dy>0)使 thumb 下移 → ratio 增大 → offset 减小(趋向最新内容),
+        // 因此 offset 变化量与 dy 反号。
+        let delta_offset = -(dy / thumb_span) * history as f32;
+        let target = (drag.grab_offset + delta_offset)
             .max(0.0)
             .min(history as f32);
         self.set_display_offset(target.floor() as i32, cx);
@@ -240,19 +250,15 @@ impl TerminalView {
         guard.grid().display_offset() as f32
     }
 
-    /// thumb 高度占轨道的比例(与 paint_scrollbar 保持一致)。
-    const THUMB_RATIO: f32 = 0.15;
-
     /// 滚动条几何:轨道高度、thumb 顶部偏移、thumb 高度(全部相对轨道顶部)。
     fn scrollbar_geometry(&self) -> (f32, f32, f32) {
         let track_height = self.viewport_height.max(0.0);
-        let thumb_height = track_height * Self::THUMB_RATIO;
-        let history = { self.session.term.lock().grid().history_size() };
-        let ratio = if history > 0 {
-            self.display_offset_value() / history as f32
-        } else {
-            0.0
+        let thumb_height = track_height * THUMB_RATIO;
+        let (history, offset) = {
+            let term = self.session.term.lock();
+            (term.grid().history_size(), term.grid().display_offset())
         };
+        let ratio = thumb_ratio(offset, history);
         let thumb_top = ratio * (track_height - thumb_height).max(0.0);
         (track_height, thumb_top, thumb_height)
     }
@@ -329,13 +335,11 @@ impl TerminalView {
 
     /// 刷新滚动条 thumb 回看比例(display_offset / history)。
     fn refresh_scrollbar_state(&self) {
-        let history = { self.session.term.lock().grid().history_size() };
-        let offset = self.display_offset_value();
-        let ratio = if history > 0 {
-            offset / history as f32
-        } else {
-            0.0
+        let (history, offset) = {
+            let term = self.session.term.lock();
+            (term.grid().history_size(), term.grid().display_offset())
         };
+        let ratio = thumb_ratio(offset, history);
         if let Ok(mut state) = self.scrollbar_state.lock() {
             state.offset_ratio = ratio;
         }
@@ -511,11 +515,11 @@ fn scrollbar_element(
 
 /// 绘制滚动条轨道与 thumb。thumb 高度 = 轨道高 ×(可见行/全部内容行),
 /// 位置 = ratio ×(轨道高 - thumb 高)。
-fn paint_scrollbar(bounds: Bounds<Pixels>, offset_ratio: f32, window: &mut Window) {
+fn paint_scrollbar(bounds: Bounds<Pixels>, thumb_ratio_value: f32, window: &mut Window) {
     let track_h: f32 = bounds.size.height.into();
-    let history_visible = 0.15_f32; // 阶段 1 固定比例(thumb 高度最小占比)
-    let thumb_h = track_h * history_visible.min(1.0);
-    let thumb_top = offset_ratio * (track_h - thumb_h).max(0.0);
+    let thumb_h = track_h * THUMB_RATIO;
+    // thumb_ratio_value:1.0 = 轨道底(最新内容),0.0 = 轨道顶(最旧内容)
+    let thumb_top = thumb_ratio_value * (track_h - thumb_h).max(0.0);
     let thumb_bounds = Bounds::new(
         Point::new(bounds.origin.x, bounds.origin.y + px(thumb_top)),
         size(px(SCROLLBAR_WIDTH), px(thumb_h)),
