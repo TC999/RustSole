@@ -557,40 +557,41 @@ impl Render for TerminalView {
 
 /// 标题栏拖动区按下。
 ///
-/// - Linux(X11/Wayland):gpui 的 `WindowControlArea` 命中框不参与平台拖动,
-///   必须显式调用 `Window::start_window_move`。
-/// - Windows:依赖 `WindowControlArea::Drag` → HTCAPTION,由系统接管;
-///   `start_window_move` 在 Windows 上是空实现,因此这里跳过。
-///
-/// 注意:Windows 的 HTCAPTION 路径在本次开发环境中因无法把窗口切到前台而**未能验证**
-/// (见汇报),需要在真实交互下确认。
+/// - Windows:gpui 的 `WindowControlArea` NC 命中路径实测未生效,`start_window_move`
+///   在该平台又是空实现,因此交给 [`term_platform::begin_window_drag`] 直连 Win32
+///   (`ReleaseCapture` + `WM_NCLBUTTONDOWN`/`HTCAPTION`),由系统接管拖动。
+/// - Linux(X11/Wayland):gpui 已实现 `start_window_move`,直接调用。
 fn start_window_drag(window: &mut Window) {
-    if term_platform::window_chrome() == term_platform::WindowChrome::AppHandled {
-        window.start_window_move();
+    match term_platform::window_chrome() {
+        term_platform::WindowChrome::SystemHandled => {
+            term_platform::begin_window_drag();
+        }
+        term_platform::WindowChrome::AppHandled => window.start_window_move(),
     }
 }
 
 /// 最大化/还原切换(双击标题栏与最大化按钮共用)。
 ///
-/// 两平台都调用 `Window::zoom_window`,但语义不同:
-/// - X11/Wayland:`zoom()` 本身就是切换(gpui `platform/linux/*/window.rs`)。
-/// - Windows:`zoom()` 只会 `SW_MAXIMIZE`,而 gpui 0.2.2 没有公开的还原 API,
-///   因此已最大化时这里是空操作(见汇报"受限"一节)。
+/// - Windows:`zoom_window` 只会 `SW_MAXIMIZE`,还原必须走
+///   [`term_platform::restore_window`] 的 `ShowWindow(SW_RESTORE)`。
+/// - X11/Wayland:`zoom()` 本身就是切换语义,直接调用即可。
 fn toggle_maximize(window: &mut Window) {
     match term_platform::window_chrome() {
-        term_platform::WindowChrome::AppHandled => window.zoom_window(),
         term_platform::WindowChrome::SystemHandled => {
-            if !window.is_maximized() {
+            if window.is_maximized() {
+                term_platform::restore_window();
+            } else {
                 window.zoom_window();
             }
         }
+        term_platform::WindowChrome::AppHandled => window.zoom_window(),
     }
 }
 
 /// 执行标题栏按钮动作。
 ///
-/// 注意:即便按钮上设置了 `WindowControlArea`,Windows 的 NC 命中测试路径在本环境实测未生效
-/// (见汇报),因此这里统一由应用侧调用 `Window` 方法,保证按钮在两平台都可用。
+/// 注意:即便按钮上设置了 `WindowControlArea`,Windows 的 NC 命中测试路径实测未生效,
+/// 因此这里统一由应用侧调用 `Window` 方法,保证按钮在两平台都可用。
 fn apply_window_control(kind: WindowControl, window: &mut Window) {
     match kind {
         WindowControl::Minimize => window.minimize_window(),
