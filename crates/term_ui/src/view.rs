@@ -498,7 +498,6 @@ impl Render for TerminalView {
                     },
                 )),
             },
-            f32::from(window.viewport_size().width),
         );
 
         div()

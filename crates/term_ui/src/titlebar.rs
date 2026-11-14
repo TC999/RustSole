@@ -100,14 +100,11 @@ pub fn control_layout(model: &TitlebarModel) -> [ControlSpec; 3] {
 
 /// 渲染标题栏。
 ///
-/// `bar_width` 是标题栏可用宽度(px)。拖动区与按钮区都用**固定宽度**相加等于它:
-/// 实测在 gpui 0.2.2 里,若拖动区用 `flex_1`(basis 0)、按钮区用内容宽度,
-/// 按钮区会被压成 0 宽(按钮整体消失);因此这里不依赖 flex 增长,直接按已知宽度分配。
-pub fn render_titlebar(
-    model: &TitlebarModel,
-    handlers: TitlebarHandlers,
-    bar_width: f32,
-) -> impl IntoElement {
+/// 布局方式:拖动区 `flex_1` 吃掉剩余宽度,按钮区固定宽度靠右。
+/// 为什么不用 `viewport_size` 手工算宽度:窗口最大化/最小化/还原时,GPUI 报告的
+/// 视口尺寸可能与窗口实际客户区短暂不一致,按它算出的固定宽度会把按钮推到窗口外
+/// (表现为"最大化后最小化再还原,三个按钮消失")。交给 flex 布局则始终贴着实际右边缘。
+pub fn render_titlebar(model: &TitlebarModel, handlers: TitlebarHandlers) -> impl IntoElement {
     let specs = control_layout(model);
     let hovered = model.hovered;
     let text_color: Hsla = if model.focused {
@@ -118,15 +115,15 @@ pub fn render_titlebar(
 
     let visible_count = specs.iter().filter(|s| s.visible).count() as f32;
     let buttons_width = visible_count * WINDOW_CONTROL_WIDTH;
-    let drag_width = (bar_width - buttons_width).max(0.0);
 
     let mut buttons = div()
         .flex()
         .flex_row()
         .items_center()
         .h_full()
-        .flex_shrink_0()
-        .w(px(buttons_width));
+        // 固定宽度 + 禁止收缩:不能参与 flex 收缩,否则会被拖动区压成 0 宽。
+        .w(px(buttons_width))
+        .flex_shrink_0();
     for spec in specs {
         buttons = buttons.child(control_button(
             &spec,
@@ -136,14 +133,14 @@ pub fn render_titlebar(
         ));
     }
 
-    // 拖动区占据除按钮区以外的整条标题栏,宽度按已知总宽算出,与按钮区互不重叠。
+    // 拖动区吃掉按钮区以外的全部宽度,与按钮区互不重叠。
     let drag_area = {
         let drag = Rc::clone(&handlers.drag);
         let hover = Rc::clone(&handlers.hover);
         div()
             .id("titlebar-drag")
-            .flex_shrink_0()
-            .w(px(drag_width))
+            .flex_1()
+            .min_w_0()
             .h_full()
             .flex()
             .items_center()
