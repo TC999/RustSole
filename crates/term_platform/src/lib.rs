@@ -19,21 +19,24 @@ pub fn platform_info() -> PlatformInfo {
     }
 }
 
-/// 自绘窗口标题栏时,窗口移动与按钮动作由谁执行。
+/// 自绘窗口标题栏时,窗口移动与还原由谁执行。
 ///
-/// 这个能力位存在的原因:gpui 0.2.2 在 Windows 上把 `WindowControlArea` 命中框
-/// 映射为 HTCAPTION/HTMINBUTTON/HTMAXBUTTON/HTCLOSE(`platform/windows/events.rs:868-878`),
-/// 设计上由系统完成拖动与按钮动作;而 X11/Wayland 的 `on_hit_test_window_control` 是空实现,
-/// 应用必须自己调用 `Window::start_window_move` / `minimize_window` / `zoom_window`。
+/// 背景:gpui 0.2.2 提供 `WindowControlArea`,Windows 上会把命中框映射为
+/// HTCAPTION/HTMINBUTTON/HTMAXBUTTON/HTCLOSE(`platform/windows/events.rs:868-878`),
+/// 由系统接管拖动与按钮。但本项目**刻意不使用它**:那会让系统认为标题栏上存在真正的
+/// 系统按钮(悬停最大化键会弹出 Windows 11 的 Snap 布局面板),与"自绘按钮 + 应用侧
+/// 处理点击"形成两套语义,互相干扰(浮层遮挡、点击偶尔失效)。
 ///
-/// 现实约束(本项目实测):Windows 上这条 NC 命中路径未能生效,因此:
-/// - 按钮动作:统一由应用侧 `on_click` 调用 `Window` 的方法;
-/// - 窗口拖动与最大化还原:由 [`begin_window_drag`] / [`restore_window`] 直连 Win32 完成。
+/// 因此两种平台的按钮点击都由应用侧 `on_click` 处理,差异只在拖动与还原的能力来源:
+/// - Windows:`Window::start_window_move` 是空实现、也没有还原 API,由本 crate 的
+///   [`begin_window_drag`] / [`restore_window`] 直连 Win32;
+/// - Linux(X11/Wayland):gpui 已实现 `start_window_move`,且 `zoom()` 本身就是
+///   最大化/还原切换,直接用 `Window` 的方法即可。
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum WindowChrome {
     /// Windows:拖动与还原走本 crate 的 Win32 实现,按钮走应用侧。
     SystemHandled,
-    /// Linux:拖动与按钮动作都由应用通过 gpui 的 `Window` 方法完成。
+    /// Linux:拖动与按钮动作都通过 gpui 的 `Window` 方法完成。
     AppHandled,
 }
 

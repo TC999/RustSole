@@ -20,7 +20,7 @@ use std::rc::Rc;
 use gpui::prelude::*;
 use gpui::{
     div, px, rgb, App, ClickEvent, Hsla, IntoElement, MouseButton, MouseDownEvent, SharedString,
-    Window, WindowControlArea,
+    Window,
 };
 
 use crate::theme::{
@@ -134,6 +134,10 @@ pub fn render_titlebar(model: &TitlebarModel, handlers: TitlebarHandlers) -> imp
     }
 
     // 拖动区吃掉按钮区以外的全部宽度,与按钮区互不重叠。
+    //
+    // 同样不设 `window_control_area(Drag)`:那会把它变成 HTCAPTION 非客户区,
+    // 使整片标题栏脱离应用的鼠标事件系统。拖动改由按下时主动调用平台层的
+    // `begin_window_drag`(Windows)或 `start_window_move`(Linux)完成。
     let drag_area = {
         let drag = Rc::clone(&handlers.drag);
         let hover = Rc::clone(&handlers.hover);
@@ -145,7 +149,6 @@ pub fn render_titlebar(model: &TitlebarModel, handlers: TitlebarHandlers) -> imp
             .flex()
             .items_center()
             .pl(px(12.0))
-            .window_control_area(WindowControlArea::Drag)
             .on_mouse_down(MouseButton::Left, move |event, window, cx| {
                 (drag)(event, window, cx);
             })
@@ -221,12 +224,6 @@ fn control_button(
         WindowControl::Close => "win-control-close",
     };
 
-    let area = match kind {
-        WindowControl::Minimize => WindowControlArea::Min,
-        WindowControl::Maximize => WindowControlArea::Max,
-        WindowControl::Close => WindowControlArea::Close,
-    };
-
     let click = Rc::clone(on_click);
     let hover = Rc::clone(on_hover);
 
@@ -240,11 +237,10 @@ fn control_button(
         .w(px(WINDOW_CONTROL_WIDTH))
         .h_full()
         .cursor_pointer()
-        // 命中区标记:让平台知道这是窗口控制按钮(Windows 上对应 HTMIN/HTMAX/HTCLOSE)。
-        // 实测 gpui 0.2.2 在 Windows 上这条 NC 命中路径没有生效(见汇报),
-        // 因此按钮动作统一由下面的 on_click 在应用侧执行;标记保留是为了平台修复后
-        // 能自动获得系统级按钮语义(Snap 布局等),Linux 合成器也可据此排布窗口控制区。
-        .window_control_area(area)
+        // 刻意**不**调用 `window_control_area`:那会让 Windows 把该区域当作真正的
+        // 系统按钮(HTMINBUTTON/HTMAXBUTTON/HTCLOSE),悬停最大化键时弹出 Snap 布局
+        // 浮层并接管点击——而我们的按钮是自绘、动作也在应用侧执行,两套语义会打架
+        // (浮层遮挡、状态错乱)。按钮完全走应用内事件。
         .on_click(move |_event, window, cx| (click)(&kind, window, cx))
         .on_hover(move |&is_hovered, window, cx| {
             let hovered = if is_hovered { Some(kind) } else { None };
