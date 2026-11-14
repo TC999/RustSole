@@ -44,6 +44,8 @@ pub struct GridSnapshot {
     pub rows_runs: Vec<Vec<TextRun>>,
     /// 光标位置(行、列)。
     pub cursor: Option<(usize, usize)>,
+    /// 当前显示偏移(回看的历史行数;0 = 显示最新内容)。
+    pub display_offset: usize,
 }
 
 /// 调色板:16 色 + 前景/背景。默认值取自常见 xterm 配色(阶段 1 无配置系统)。
@@ -120,9 +122,11 @@ pub fn snapshot(term: &Term<ChannelListener>) -> GridSnapshot {
 
     // alacritty 0.26 索引:Line(0) 是视口顶行,Line(rows-1) 是视口底行,负行是 scrollback
     // (依据:grid/mod.rs display_iter 起点 Line(-offset-1) 与 Dimensions::bottommost_line = screen_lines-1)
+    // display_offset>0 时视口顶行下移到 Line(-offset),快照必须按偏移遍历,否则回看内容不对。
+    let top_line = -(grid.display_offset() as i32);
     let mut rows_runs = Vec::with_capacity(rows);
-    for line in 0..rows as i32 {
-        let l = Line(line);
+    for i in 0..rows as i32 {
+        let l = Line(top_line + i);
         let row = &grid[l];
         let mut runs: Vec<TextRun> = Vec::new();
         let mut cur_text = String::new();
@@ -208,5 +212,6 @@ pub fn snapshot(term: &Term<ChannelListener>) -> GridSnapshot {
         cols,
         rows_runs,
         cursor,
+        display_offset: grid.display_offset(),
     }
 }

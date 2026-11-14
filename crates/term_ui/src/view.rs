@@ -6,9 +6,12 @@ use std::sync::Arc;
 use gpui::prelude::*;
 use gpui::{
     canvas, div, fill, font, px, rgb, size, App, Bounds, Context, ElementInputHandler, Entity,
-    EntityInputHandler, FocusHandle, Focusable, IntoElement, KeyDownEvent, Pixels, Point, Render,
-    SharedString, UTF16Selection, Window,
+    EntityInputHandler, FocusHandle, Focusable, IntoElement, KeyDownEvent, MouseButton,
+    MouseDownEvent, MouseMoveEvent, Pixels, Point, Render, ScrollWheelEvent, SharedString,
+    UTF16Selection, Window,
 };
+
+use alacritty_terminal::grid::{Dimensions as _, Scroll};
 
 use term_core::key::{encode_key, KeyState};
 use term_core::proxy::TermEventMsg;
@@ -20,6 +23,17 @@ use crate::grid::{snapshot, GridSnapshot};
 pub const CELL_WIDTH: f32 = 8.0;
 pub const CELL_HEIGHT: f32 = 16.0;
 pub const FONT_SIZE: f32 = 14.0;
+
+/// 滚动条轨道宽度(px)。
+pub const SCROLLBAR_WIDTH: f32 = 10.0;
+
+/// 滚动条拖动状态。grab_y 是按下时相对滚动条轨道顶部的 y(px),
+/// grab_offset 是按下时 thumb 对应的 display_offset,保证拖动不跳变。
+#[derive(Debug, Clone, Copy)]
+struct ScrollDrag {
+    grab_y: f32,
+    grab_offset: f32,
+}
 
 /// 终端视图状态。
 pub struct TerminalView {
@@ -34,6 +48,12 @@ pub struct TerminalView {
     /// IME 组合中(pinyin 等输入法的预编辑阶段)。组合中的按键不进 PTY,
     /// 由 IME 提交结果后经 replace_text_in_range 写入。
     ime_composing: bool,
+    /// 滚动条拖动状态(按下拖动期间);None 表示未拖动。
+    scroll_drag: Option<ScrollDrag>,
+    /// 最近一次视口高度(px),滚动条几何需要。
+    viewport_height: f32,
+    /// 滚动条渲染状态(thumb 回看比例),事件与渲染共享。
+    scrollbar_state: Arc<std::sync::Mutex<ScrollbarState>>,
     /// 待渲染快照(Wakeup 时刷新)。
     snapshot: Arc<GridSnapshot>,
 }
@@ -58,11 +78,17 @@ impl TerminalView {
             rows,
             cell_width: CELL_WIDTH,
             ime_composing: false,
+            scroll_drag: None,
+            viewport_height: 0.0,
+            scrollbar_state: Arc::new(std::sync::Mutex::new(ScrollbarState {
+                offset_ratio: 0.0,
+            })),
             snapshot: Arc::new(GridSnapshot {
                 rows: rows as usize,
                 cols: cols as usize,
                 rows_runs: Vec::new(),
                 cursor: None,
+                display_offset: 0,
             }),
         });
 
@@ -115,6 +141,90 @@ impl TerminalView {
         .detach();
     }
 
+    /// 滚动条按下:命中 thumb 区域时开始拖动,否则跳转到点击位置。
+    fn scrollbar_mouse_down(&mut self, event: &MouseDownEvent, cx: &mut Context<Self>) {
+        if event.button != MouseButton::Left {
+            return;
+        }
+        // 鼠标事件 position 是视口坐标;滚动条轨道从视口顶部开始,y 直接换算
+        self.scrollbar_jump_or_drag(event.position.y.into(), cx);
+    }
+
+    /// 滚动条拖动:y 变化按 thumb 跨度换算 display_offset。
+    fn scrollbar_mouse_move(&mut self, event: &MouseMoveEvent, cx: &mut Context<Self>) {
+        let Some(drag) = self.scroll_drag else {
+            return;
+        };
+        if event.pressed_button != Some(MouseButton::Left) {
+            // 未收到 mouse_up(极端情况):结束拖动
+            self.scroll_drag = None;
+            return;
+        }
+        self.apply_drag(drag, event.position.y.into(), cx);
+    }
+
+    /// 按下时的两种行为:点在 thumb 上则原地拖动,否则跳转到该位置。
+    fn scrollbar_jump_or_drag(&mut self, y_px: f32, cx: &mut Context<Self>) {
+        let history = { self.session.term.lock().grid().history_size() };
+        if history == 0 {
+            return;
+        }
+        let (track_height, thumb_top, thumb_height) = self.scrollbar_geometry();
+        let relative = y_px.max(0.0).min(track_height);
+        let in_thumb = thumb_top <= relative && relative < thumb_top + thumb_height;
+        if in_thumb {
+            // 抓到 thumb:记录起点,不跳转,避免手抖跳变
+            self.scroll_drag = Some(ScrollDrag {
+                grab_y: y_px,
+                grab_offset: self.display_offset_value(),
+            });
+        } else {
+            // 点在轨道空白:跳转到对应历史位置
+            let target = (relative / track_height) * history as f32;
+            self.set_display_offset(target.floor() as i32, cx);
+        }
+    }
+
+    /// 拖动执行:按 y 偏移换算目标 offset。
+    fn apply_drag(&mut self, drag: ScrollDrag, y_px: f32, cx: &mut Context<Self>) {
+        let history = { self.session.term.lock().grid().history_size() };
+        if history == 0 {
+            return;
+        }
+        let (track_height, _thumb_top, thumb_height) = self.scrollbar_geometry();
+        let dy = y_px - drag.grab_y;
+        // thumb 在轨道上的可移动跨度
+        let thumb_span = (track_height - thumb_height).max(1.0);
+        let delta_ratio = dy / thumb_span;
+        let target = (drag.grab_offset + delta_ratio * history as f32)
+            .max(0.0)
+            .min(history as f32);
+        self.set_display_offset(target.floor() as i32, cx);
+    }
+
+    /// 当前 display_offset(锁内直接读)。
+    fn display_offset_value(&self) -> f32 {
+        let guard = self.session.term.lock();
+        guard.grid().display_offset() as f32
+    }
+
+    /// thumb 高度占轨道的比例(与 paint_scrollbar 保持一致)。
+    const THUMB_RATIO: f32 = 0.15;
+
+    /// 滚动条几何:轨道高度、thumb 顶部偏移、thumb 高度(全部相对轨道顶部)。
+    fn scrollbar_geometry(&self) -> (f32, f32, f32) {
+        let track_height = self.viewport_height.max(0.0);
+        let thumb_height = track_height * Self::THUMB_RATIO;
+        let history = { self.session.term.lock().grid().history_size() };
+        let ratio = if history > 0 {
+            self.display_offset_value() / history as f32
+        } else {
+            0.0
+        };
+        let thumb_top = ratio * (track_height - thumb_height).max(0.0);
+        (track_height, thumb_top, thumb_height)
+    }
+
     /// 实测等宽字体的单字符 advance。首次调用后缓存,字体不变则不再 shape。
     /// 不用硬编码 CELL_WIDTH 的原因:不同平台字体(Consolas/monospace)与字号的实际 advance
     /// 与 8px 有偏差,网格列按 8px 排布会让背景块与文本错位(表现为空格过宽)。
@@ -155,6 +265,50 @@ impl TerminalView {
         }
     }
 
+    /// 滚动 display_offset delta 行。Delta 正值 = 回看更多历史(MOUSE-003 主屏回看行为)。
+    /// 在 Term 锁内修改,锁外刷新快照并 notify。
+    fn scroll_lines(&mut self, delta: i32, cx: &mut Context<Self>) {
+        let history = { self.session.term.lock().grid().history_size() };
+        if history == 0 {
+            // 没有历史,滚动无意义
+            return;
+        }
+        { let mut term = self.session.term.lock(); term.scroll_display(Scroll::Delta(delta)); }
+        self.refresh_scrollbar_state();
+        self.refresh_snapshot();
+        cx.notify();
+    }
+
+    /// 把 display_offset 直接设置到目标值(点击/拖动滚动条用),带钳制。锁内一次完成。
+    fn set_display_offset(&mut self, target: i32, cx: &mut Context<Self>) {
+        { let mut term = self.session.term.lock();
+            let history = term.grid().history_size();
+            if history == 0 {
+                return;
+            }
+            let current = term.grid().display_offset() as i32;
+            let clamped = target.max(0).min(history as i32);
+            term.scroll_display(Scroll::Delta(clamped - current));
+        }
+        self.refresh_scrollbar_state();
+        self.refresh_snapshot();
+        cx.notify();
+    }
+
+    /// 刷新滚动条 thumb 回看比例(display_offset / history)。
+    fn refresh_scrollbar_state(&self) {
+        let history = { self.session.term.lock().grid().history_size() };
+        let offset = self.display_offset_value();
+        let ratio = if history > 0 {
+            offset / history as f32
+        } else {
+            0.0
+        };
+        if let Ok(mut state) = self.scrollbar_state.lock() {
+            state.offset_ratio = ratio;
+        }
+    }
+
     /// 不变量 2:锁内只取快照,立即释放。
     fn refresh_snapshot(&mut self) {
         let guard = self.session.term.lock();
@@ -168,8 +322,9 @@ impl TerminalView {
         let vp = window.viewport_size();
         let width: f32 = vp.width.into();
         let height: f32 = vp.height.into();
+        // 扣掉滚动条轨道宽度(列数按终端画布实际可用宽度算)
         // alacritty 限制:MIN_COLUMNS=2,可见行至少 1
-        let new_cols = ((width / self.cell_width).floor() as u16).max(2);
+        let new_cols = (((width - SCROLLBAR_WIDTH) / self.cell_width).floor() as u16).max(2);
         let new_rows = ((height / CELL_HEIGHT).floor() as u16).max(1);
         if new_cols != self.cols || new_rows != self.rows {
             self.cols = new_cols;
@@ -254,24 +409,92 @@ impl Render for TerminalView {
             .on_key_down(cx.listener(|view, event: &KeyDownEvent, window, cx| {
                 view.handle_key(event, window, cx);
             }))
+            // 终端画布区:滚轮回看历史
+            .on_scroll_wheel(cx.listener(|view, event: &ScrollWheelEvent, _window, cx| {
+                let delta = event.delta.pixel_delta(px(CELL_HEIGHT));
+                // 滚轮像素 delta 换算行数;负值(上滚)→ 回看
+                let y_px: f32 = delta.y.into();
+                let lines_f = (y_px / CELL_HEIGHT) as i32;
+                if lines_f != 0 {
+                    view.scroll_lines(-lines_f, cx);
+                }
+            }))
             .child(
-                canvas(
-                    // prepaint:此元素不需要额外状态
-                    |_bounds, _window, _cx| {},
-                    // paint:逐行绘制文本 run(相邻同样式单元格已合并)
-                    move |bounds, (), window, cx| {
-                        // 注册 IME 输入处理器(paint 阶段必须;焦点在终端时平台才会投递组合文本)
-                        window.handle_input(
-                            &focus,
-                            ElementInputHandler::new(bounds, this),
-                            cx,
-                        );
-                        paint_grid(&snapshot, cell_width, bounds, window, cx);
-                    },
-                )
-                .size_full(),
+                div()
+                    .size_full()
+                    .flex()
+                    .child(
+                        canvas(
+                            |_bounds, _window, _cx| {},
+                            move |bounds, (), window, cx| {
+                                // 注册 IME 输入处理器(paint 阶段必须;焦点在终端时平台才会投递组合文本)
+                                window.handle_input(
+                                    &focus,
+                                    ElementInputHandler::new(bounds, this),
+                                    cx,
+                                );
+                                paint_grid(&snapshot, cell_width, bounds, window, cx);
+                            },
+                        )
+                        .size_full(),
+                    )
+                    .child(scrollbar_element(
+                        Arc::clone(&self.scrollbar_state),
+                        cx.listener(|view, event: &MouseDownEvent, _window, cx| {
+                            view.scrollbar_mouse_down(event, cx);
+                        }),
+                        cx.listener(|view, event: &MouseMoveEvent, _window, cx| {
+                            view.scrollbar_mouse_move(event, cx);
+                        }),
+                    )),
             )
     }
+}
+
+/// 滚动条状态(跨事件与渲染共享):thumb 的回看比例 0..1。
+#[derive(Debug)]
+struct ScrollbarState {
+    offset_ratio: f32,
+}
+
+/// 滚动条元素:div 容器包 canvas(canvas 不实现 InteractiveElement,事件注册在 div 上)。
+fn scrollbar_element(
+    state: Arc<std::sync::Mutex<ScrollbarState>>,
+    mouse_down: impl Fn(&MouseDownEvent, &mut Window, &mut App) + 'static,
+    mouse_move: impl Fn(&MouseMoveEvent, &mut Window, &mut App) + 'static,
+) -> gpui::AnyElement {
+    div()
+        .w(px(SCROLLBAR_WIDTH))
+        .bg(rgb(0x181818))
+        .child(
+            canvas(
+                // prepaint:thumb 位置由状态决定
+                move |_bounds, _window, _cx| (),
+                // paint:从共享状态读取 offset_ratio 绘制 thumb
+                move |bounds, (), window, _cx| {
+                    let ratio = state.lock().map(|s| s.offset_ratio).unwrap_or(0.0);
+                    paint_scrollbar(bounds, ratio, window);
+                },
+            )
+            .size_full(),
+        )
+        .on_mouse_down(MouseButton::Left, mouse_down)
+        .on_mouse_move(mouse_move)
+        .into_any_element()
+}
+
+/// 绘制滚动条轨道与 thumb。thumb 高度 = 轨道高 ×(可见行/全部内容行),
+/// 位置 = ratio ×(轨道高 - thumb 高)。
+fn paint_scrollbar(bounds: Bounds<Pixels>, offset_ratio: f32, window: &mut Window) {
+    let track_h: f32 = bounds.size.height.into();
+    let history_visible = 0.15_f32; // 阶段 1 固定比例(thumb 高度最小占比)
+    let thumb_h = track_h * history_visible.min(1.0);
+    let thumb_top = offset_ratio * (track_h - thumb_h).max(0.0);
+    let thumb_bounds = Bounds::new(
+        Point::new(bounds.origin.x, bounds.origin.y + px(thumb_top)),
+        size(px(SCROLLBAR_WIDTH), px(thumb_h)),
+    );
+    window.paint_quad(fill(thumb_bounds, rgb(0x555555)));
 }
 
 /// 绘制网格:先背景块,再文本,最后光标。所有数据来自快照,无锁。
