@@ -1,7 +1,9 @@
-//! alacritty EventListener 实现:把终端事件经 channel 转交 GPUI 主线程。
+//! alacritty EventListener 实现:把终端事件写入共享队列,由 UI 侧任务消费。
 //! PTY 读写与 Term 更新都在 EventLoop 线程(ARCHITECTURE.md 不变量 3)。
 
-use std::sync::mpsc;
+use std::collections::VecDeque;
+use std::sync::atomic::{AtomicUsize, Ordering};
+use std::sync::{Arc, Mutex};
 
 use alacritty_terminal::event::{Event as TermEvent, EventListener};
 
@@ -20,22 +22,63 @@ pub enum TermEventMsg {
     Other,
 }
 
-/// 把 TermEvent 投递到 channel 的监听器。
+/// EventLoop 线程与 UI 任务之间的共享事件队列。
+///
+/// 生产者:alacritty EventLoop 线程。消费者:UI 主线程 / 异步事件任务(两者只应有一个在消费,
+/// 见 `Session::poll_events` 与 `SharedEventQueue`)。锁临界区只有入队/出队,满足不变量 2。
+#[derive(Default)]
+pub struct EventQueue {
+    queue: Mutex<VecDeque<TermEventMsg>>,
+    /// 当前积压事件数;0 表示无需唤醒(消费者据此决定是否休眠,避免无谓加锁)。
+    pending: AtomicUsize,
+}
+
+impl EventQueue {
+    /// 投递一个事件(EventLoop 线程调用)。
+    fn push(&self, msg: TermEventMsg) {
+        // 队列丢失仅在持有方全部释放后不可能发生;锁中毒说明已有 panic,传播即可
+        if let Ok(mut q) = self.queue.lock() {
+            q.push_back(msg);
+            self.pending.fetch_add(1, Ordering::Release);
+        }
+    }
+
+    /// 非阻塞取走全部积压事件。
+    pub fn drain(&self) -> Vec<TermEventMsg> {
+        let taken = match self.queue.lock() {
+            Ok(mut q) => {
+                let drained: Vec<TermEventMsg> = q.drain(..).collect();
+                drained
+            },
+            Err(_) => Vec::new(),
+        };
+        if !taken.is_empty() {
+            self.pending.fetch_sub(taken.len(), Ordering::Release);
+        }
+        taken
+    }
+
+    /// 是否可能有积压事件(廉价检查,无锁)。
+    pub fn has_pending(&self) -> bool {
+        self.pending.load(Ordering::Acquire) > 0
+    }
+}
+
+/// 把 TermEvent 投递到共享队列的监听器。
 #[derive(Clone)]
 pub struct ChannelListener {
-    tx: mpsc::Sender<TermEventMsg>,
+    queue: Arc<EventQueue>,
 }
 
 impl ChannelListener {
-    pub fn new(tx: mpsc::Sender<TermEventMsg>) -> Self {
-        Self { tx }
+    pub fn new(queue: Arc<EventQueue>) -> Self {
+        Self { queue }
     }
 }
 
 impl EventListener for ChannelListener {
     fn send_event(&self, event: TermEvent) {
-        // 向已关闭的 channel 发送失败也无影响:会话已被销毁(CODING_STANDARDS.md 第 3 节)
-        let _ = self.tx.send(match event {
+        self.queue.push(match event {
             TermEvent::Wakeup => TermEventMsg::Wakeup,
             TermEvent::ChildExit(_) => TermEventMsg::Exited,
             TermEvent::Exit => TermEventMsg::Exited,

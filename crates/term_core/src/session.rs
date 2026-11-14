@@ -2,7 +2,6 @@
 //! 独立于 View,View 只持有引用并负责显示(不变量 1)。
 
 use std::borrow::Cow;
-use std::sync::mpsc::{self, Receiver};
 use std::sync::Arc;
 
 use alacritty_terminal::event::WindowSize;
@@ -12,7 +11,7 @@ use alacritty_terminal::term::{test::TermSize, Term};
 use alacritty_terminal::tty;
 use alacritty_terminal::tty::Options as TtyOptions;
 
-use crate::proxy::{ChannelListener, TermEventMsg};
+use crate::proxy::{ChannelListener, EventQueue, TermEventMsg};
 
 /// 共享的 Term 句柄:渲染与 EventLoop 线程共用,锁的临界区必须短(不变量 2)。
 pub type SharedTerm = Arc<FairMutex<Term<ChannelListener>>>;
@@ -23,8 +22,8 @@ pub struct Session {
     pub term: SharedTerm,
     /// 向 PTY 写入的句柄(键盘输入、resize 指令)。
     notifier: Notifier,
-    /// 终端事件接收端(UI 线程轮询)。
-    pub events: Receiver<TermEventMsg>,
+    /// 共享事件队列(EventLoop 线程生产,UI 消费)。
+    events: Arc<EventQueue>,
     /// 事件循环线程句柄(spawn 返回 (EventLoop, State),退出时可恢复,这里直接持有)。
     loop_thread: Option<std::thread::JoinHandle<(EventLoop<tty::Pty, ChannelListener>, LoopState)>>,
     /// 会话是否已退出(子进程结束)。
@@ -37,8 +36,8 @@ impl Session {
     /// # Errors
     /// PTY 分配或 shell 启动失败时返回 io 错误。
     pub fn new(cols: u16, rows: u16) -> std::io::Result<Self> {
-        let (tx, rx) = mpsc::channel::<TermEventMsg>();
-        let listener = ChannelListener::new(tx);
+        let events = Arc::new(EventQueue::default());
+        let listener = ChannelListener::new(Arc::clone(&events));
 
         let term = Arc::new(FairMutex::new(Term::new(
             alacritty_terminal::term::Config::default(),
@@ -67,7 +66,7 @@ impl Session {
         Ok(Self {
             term,
             notifier,
-            events: rx,
+            events,
             loop_thread: Some(thread_handle),
             exited: false,
         })
@@ -100,16 +99,18 @@ impl Session {
         }
     }
 
-    /// 非阻塞轮询事件(UI 主线程每帧调用,不等待)。
+    /// 非阻塞排空事件队列并更新退出状态。
     pub fn poll_events(&mut self) -> Vec<TermEventMsg> {
-        let mut out = Vec::new();
-        while let Ok(msg) = self.events.try_recv() {
-            if matches!(msg, TermEventMsg::Exited) {
-                self.exited = true;
-            }
-            out.push(msg);
+        let taken = self.events.drain();
+        if taken.iter().any(|m| matches!(m, TermEventMsg::Exited)) {
+            self.exited = true;
         }
-        out
+        taken
+    }
+
+    /// 供异步事件任务的共享队列句柄(与 poll_events 消费同一队列,不会重复消费)。
+    pub fn events_handle(&self) -> Arc<EventQueue> {
+        Arc::clone(&self.events)
     }
 
     /// 子进程是否已退出。

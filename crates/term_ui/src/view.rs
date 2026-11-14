@@ -44,7 +44,7 @@ impl TerminalView {
             .map_err(|e| gpui::private::anyhow::anyhow!("启动终端会话失败: {e}"))?;
 
         let focus = cx.focus_handle();
-        Ok(cx.new(|_| Self {
+        let view = cx.new(|_| Self {
             session,
             focus,
             cols,
@@ -55,23 +55,55 @@ impl TerminalView {
                 rows_runs: Vec::new(),
                 cursor: None,
             }),
-        }))
+        });
+
+        // 事件驱动重绘:后台任务把 PTY 事件合并后唤醒主线程(不变量 4:约 8ms 合并)
+        view.update(cx, |view, cx| view.spawn_event_loop(cx));
+        Ok(view)
     }
 
-    /// 从会话拉取事件并按需刷新快照。render 每帧调用;无变化时零分配直接返回。
-    fn poll(&mut self, cx: &mut Context<Self>) {
-        let events = self.session.poll_events();
-        for ev in &events {
-            if let TermEventMsg::PtyWrite(s) = ev {
-                // 程序的应答序列(如 DA/DSR)直接写回 PTY
-                self.session.write(s.as_bytes());
-            }
-        }
+    /// 常驻任务:等待 PTY 事件 → 批量合并 → notify 主线程重绘(不变量 4:合并唤醒)。
+    /// 不持 Term 锁、不在锁内做长工作(不变量 2)。
+    fn spawn_event_loop(&mut self, cx: &mut Context<Self>) {
+        let events = self.session.events_handle();
+        cx.spawn(async move |weak, cx| {
+            loop {
+                // std 通道式阻塞在 async 里不可用;用轻量轮询等待事件到来(空转仅原子读,4ms 粒度)
+                while !events.has_pending() {
+                    gpui::Timer::after(std::time::Duration::from_millis(4)).await;
+                }
 
-        if !events.is_empty() {
-            self.refresh_snapshot();
-            cx.notify();
-        }
+                // 排空当前积压,合并为一次主线程更新
+                let taken = events.drain();
+                let mut had_wakeup = false;
+                let mut pty_writes: Vec<String> = Vec::new();
+                for msg in taken {
+                    match msg {
+                        TermEventMsg::Wakeup | TermEventMsg::Exited => had_wakeup = true,
+                        TermEventMsg::PtyWrite(s) => pty_writes.push(s),
+                        TermEventMsg::Title(_) | TermEventMsg::Other => {},
+                    }
+                }
+
+                let ok = weak
+                    .update(cx, |view, cx| {
+                        // 程序应答序列写回 PTY
+                        for s in &pty_writes {
+                            view.session.write(s.as_bytes());
+                        }
+                        if had_wakeup {
+                            view.refresh_snapshot();
+                            cx.notify();
+                        }
+                    })
+                    .is_ok();
+                // 视图已释放:会话结束,退出任务
+                if !ok {
+                    return;
+                }
+            }
+        })
+        .detach();
     }
 
     /// 不变量 2:锁内只取快照,立即释放。
@@ -143,7 +175,7 @@ impl Focusable for TerminalView {
 
 impl Render for TerminalView {
     fn render(&mut self, window: &mut Window, cx: &mut Context<Self>) -> impl IntoElement {
-        self.poll(cx);
+        // PTY 事件由 spawn_event_loop 的常驻任务驱动重绘;render 只处理视口尺寸变化
         self.sync_size(window, cx);
 
         let snapshot = Arc::clone(&self.snapshot);
