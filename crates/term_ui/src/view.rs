@@ -221,6 +221,9 @@ impl TerminalView {
             },
         ) {
             self.session.write(&bytes);
+            // 字符已由键盘编码路径处理:阻止传播,否则 gpui 对未处理事件调用 TranslateMessage
+            // 生成 WM_CHAR,handle_char_msg 会经 replace_text_in_range 把同一字符再写一次(双字母)
+            cx.stop_propagation();
             cx.notify();
         }
     }
@@ -368,8 +371,14 @@ impl EntityInputHandler for TerminalView {
         _window: &mut Window,
         _cx: &mut Context<Self>,
     ) -> Option<std::ops::Range<usize>> {
-        // 不显示预编辑文本
-        None
+        // 组合中返回非空 range:gpui 据此在组合期间吞掉原始按键的 KeyDown
+        // (events.rs handle_keydown_msg 的 is_composing 分支),防止拼音字母进入 PTY。
+        // 终端不显示预编辑,这里只做状态声明。
+        if self.ime_composing {
+            Some(0..1)
+        } else {
+            None
+        }
     }
 
     fn unmark_text(&mut self, _window: &mut Window, _cx: &mut Context<Self>) {
