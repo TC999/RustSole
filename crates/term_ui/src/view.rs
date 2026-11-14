@@ -368,6 +368,28 @@ impl TerminalView {
         self.scrollbar_ratio = thumb_ratio(offset, history);
     }
 
+    /// 本帧实际可用的客户区尺寸(逻辑像素)。
+    ///
+    /// 优先用 Win32 读到的真实客户区:窗口"最大化 -> 最小化 -> 还原为普通尺寸"后,
+    /// gpui 的 `viewport_size()` 可能仍停留在最大化时的大小,而按它布局的自绘元素
+    /// (标题栏按钮、滚动条)会被画到窗口外。两者相差超过 1px 时以系统值为准
+    /// (1px 以内视为取整误差,避免每帧来回切换导致布局抖动)。
+    fn layout_size(window: &Window) -> (f32, f32) {
+        let vp = window.viewport_size();
+        let viewport = (f32::from(vp.width), f32::from(vp.height));
+        match term_platform::client_size_logical(window.scale_factor()) {
+            Some((w, h)) if w > 1.0 && h > 1.0 => {
+                let differs = (w - viewport.0).abs() > 1.0 || (h - viewport.1).abs() > 1.0;
+                if differs {
+                    (w, h)
+                } else {
+                    viewport
+                }
+            }
+            _ => viewport,
+        }
+    }
+
     /// 不变量 2:锁内只取快照,立即释放。
     fn refresh_snapshot(&mut self) {
         let guard = self.session.term.lock();
@@ -377,12 +399,14 @@ impl TerminalView {
     }
 
     /// 视口尺寸变化时,把字符网格调整为新的 cols/rows,并通知 PTY 与 Term。
-    fn sync_size(&mut self, window: &mut Window, cx: &mut Context<Self>) {
-        let vp = window.viewport_size();
-        let width: f32 = vp.width.into();
+    ///
+    /// `size` 是本帧实际可用的客户区尺寸(逻辑像素),由 [`Self::layout_size`] 校正后传入,
+    /// 不一定等于 `window.viewport_size()`。
+    fn sync_size(&mut self, size: (f32, f32), cx: &mut Context<Self>) {
+        let (width, height) = size;
         // 视口高度里扣掉自绘标题栏:终端网格只占标题栏以下的区域(WIN-001)。
         // 若不扣,最后一行会被标题栏遮住,且 `stty size` 比可见行数多 2 行左右。
-        let height: f32 = (f32::from(vp.height) - crate::theme::TITLEBAR_HEIGHT).max(0.0);
+        let height: f32 = (height - crate::theme::TITLEBAR_HEIGHT).max(0.0);
         // 扣掉滚动条轨道宽度(列数按终端画布实际可用宽度算)
         // alacritty 限制:MIN_COLUMNS=2,可见行至少 1
         let new_cols = (((width - SCROLLBAR_WIDTH) / self.cell_width).floor() as u16).max(2);
@@ -456,8 +480,11 @@ impl Focusable for TerminalView {
 
 impl Render for TerminalView {
     fn render(&mut self, window: &mut Window, cx: &mut Context<Self>) -> impl IntoElement {
+        // 先用校正后的客户区尺寸(而不是可能滞后的 viewport_size)同步终端网格,
+        // 再用同一个尺寸给根节点显式宽高,保证自绘元素不会被画到窗口外。
+        let layout = Self::layout_size(window);
         // PTY 事件由 spawn_event_loop 的常驻任务驱动重绘;render 只处理视口尺寸变化
-        self.sync_size(window, cx);
+        self.sync_size(layout, cx);
         self.measure_cell_width(window);
 
         // 窗口从最小化恢复时,GPUI 那一帧的呈现可能不包含自绘内容,
@@ -521,7 +548,10 @@ impl Render for TerminalView {
 
         div()
             .id("terminal-root")
-            .size_full()
+            // 显式宽高而不是 size_full:窗口状态变化后 gpui 的 viewport 可能滞后,
+            // 用实测客户区尺寸可以让标题栏按钮与滚动条始终落在窗口内。
+            .w(px(layout.0))
+            .h(px(layout.1))
             .flex()
             .flex_col()
             .bg(rgb(window_theme::WINDOW_BG))

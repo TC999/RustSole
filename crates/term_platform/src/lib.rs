@@ -85,6 +85,32 @@ pub fn restore_window() -> bool {
     }
 }
 
+/// 窗口客户区的实际尺寸,换算成逻辑像素(已除以 `scale_factor`)。
+///
+/// 为什么需要:窗口"最大化 -> 最小化 -> 还原为普通尺寸"时,gpui 报告的
+/// `viewport_size()` 可能仍停留在最大化时的大小,而按它布局的自绘元素(标题栏按钮、
+/// 滚动条)会被画到窗口外,表现为"按钮和滚动条消失、点一下别的窗口又回来"。
+/// 这里直接向系统要真实客户区尺寸,供上层校正布局。
+///
+/// 返回 `None`:非 Windows 平台,或窗口尚未创建/系统调用失败 —— 调用方应回退到
+/// `viewport_size()`。
+pub fn client_size_logical(scale_factor: f32) -> Option<(f32, f32)> {
+    #[cfg(target_os = "windows")]
+    {
+        // 缩放因子异常时不换算,避免把布局算成 0 或负数
+        if !(scale_factor.is_finite() && scale_factor > 0.0) {
+            return None;
+        }
+        let (w, h) = win32::client_size()?;
+        Some((w / scale_factor, h / scale_factor))
+    }
+    #[cfg(not(target_os = "windows"))]
+    {
+        let _ = scale_factor;
+        None
+    }
+}
+
 #[cfg(target_os = "windows")]
 fn default_font_family() -> &'static str {
     // Windows 系统自带等宽字体

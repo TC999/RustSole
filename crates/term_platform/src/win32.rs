@@ -44,6 +44,7 @@ extern "system" {
     fn IsWindowVisible(hwnd: Hwnd) -> i32;
     fn GetClassNameW(hwnd: Hwnd, buf: *mut u16, max: i32) -> i32;
     fn GetWindowRect(hwnd: Hwnd, rect: *mut WinRect) -> i32;
+    fn GetClientRect(hwnd: Hwnd, rect: *mut WinRect) -> i32;
     fn SendMessageW(hwnd: Hwnd, msg: u32, wparam: usize, lparam: isize) -> isize;
     fn ReleaseCapture() -> i32;
     fn ShowWindow(hwnd: Hwnd, cmd: i32) -> i32;
@@ -113,6 +114,42 @@ fn find_main_window() -> Option<Hwnd> {
     ctx.exact.or(ctx.largest.map(|(hwnd, _)| hwnd))
 }
 
+/// 缓存主窗口句柄,避免每次拖动/还原/读尺寸都枚举一遍所有窗口。
+///
+/// 用 `isize` 保存是因为裸指针不是 `Sync`。阶段 1 单窗口,窗口销毁重建的场景不存在;
+/// 将来支持多窗口时必须改为由上层传入句柄。
+static MAIN_HWND: std::sync::OnceLock<isize> = std::sync::OnceLock::new();
+
+/// 取主窗口句柄(首次调用时枚举并缓存)。
+fn main_window() -> Option<Hwnd> {
+    if let Some(&cached) = MAIN_HWND.get() {
+        return Some(cached as Hwnd);
+    }
+    let found = find_main_window()?;
+    // 并发下若已被别的线程写入,以缓存值为准(两者是同一个窗口)。
+    let _ = MAIN_HWND.set(found as isize);
+    MAIN_HWND.get().map(|&h| h as Hwnd)
+}
+
+/// 读取主窗口客户区的实际尺寸(物理像素)。
+///
+/// 用途:窗口"最大化 -> 最小化 -> 还原为普通尺寸"后,GPUI 报告的视口尺寸可能仍是
+/// 最大化时的大小,导致按视口布局的自绘元素(标题栏按钮、滚动条)被画到窗口外。
+/// 这里直接问系统要真实客户区,由上层据此校正布局。
+///
+/// 返回 `None` 表示还没找到窗口(启动早期)或系统调用失败。
+pub(crate) fn client_size() -> Option<(f32, f32)> {
+    let hwnd = main_window()?;
+    let mut rect = WinRect::default();
+    // SAFETY: `hwnd` 来自 EnumWindows 枚举且已确认属于本进程;`rect` 是栈上可写结构。
+    if unsafe { GetClientRect(hwnd, &mut rect) } == 0 {
+        return None;
+    }
+    let w = (rect.right - rect.left).max(0) as f32;
+    let h = (rect.bottom - rect.top).max(0) as f32;
+    Some((w, h))
+}
+
 /// 发起窗口拖动(阻塞到拖动结束)。
 ///
 /// Windows 的标准做法:先释放鼠标捕获,再投递 `WM_NCLBUTTONDOWN` + `HTCAPTION`,
@@ -121,10 +158,10 @@ fn find_main_window() -> Option<Hwnd> {
 /// 返回值:是否成功找到窗口并发起拖动。找不到窗口时返回 `false`(调用方忽略即可,
 /// 表现为"按住标题栏没有反应",不会 panic)。
 pub(crate) fn begin_drag() -> bool {
-    let Some(hwnd) = find_main_window() else {
+    let Some(hwnd) = main_window() else {
         return false;
     };
-    // SAFETY: `hwnd` 刚由 EnumWindows 取得、属于本进程;ReleaseCapture 无参数,
+    // SAFETY: `hwnd` 来自本进程窗口;ReleaseCapture 无参数,
     // SendMessageW 的参数按 Win32 约定:WM_NCLBUTTONDOWN 的 wParam 是命中码,
     // lParam 为鼠标坐标(0 表示使用当前光标位置,系统移动循环会接管)。
     unsafe {
@@ -138,11 +175,10 @@ pub(crate) fn begin_drag() -> bool {
 ///
 /// 返回值:是否成功找到窗口并调用。窗口本来就没最大化时调用也无副作用。
 pub(crate) fn restore() -> bool {
-    let Some(hwnd) = find_main_window() else {
+    let Some(hwnd) = main_window() else {
         return false;
     };
-    // SAFETY: `hwnd` 由 EnumWindows 取得且属于本进程;SW_RESTORE 是合法的
-    // ShowWindow 命令码。
+    // SAFETY: `hwnd` 来自本进程窗口;SW_RESTORE 是合法的 ShowWindow 命令码。
     unsafe { ShowWindow(hwnd, SW_RESTORE) };
     true
 }
