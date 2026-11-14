@@ -27,6 +27,9 @@ pub struct TerminalView {
     /// 当前生效的字符网格尺寸。
     cols: u16,
     rows: u16,
+    /// 实测的单字符 advance(px)。首次绘制时测量,替换粗略的 CELL_WIDTH 常量,
+    /// 避免网格列宽与字体实际宽度不一致造成的空格过宽/错位。
+    cell_width: f32,
     /// 待渲染快照(Wakeup 时刷新)。
     snapshot: Arc<GridSnapshot>,
 }
@@ -49,6 +52,7 @@ impl TerminalView {
             focus,
             cols,
             rows,
+            cell_width: CELL_WIDTH,
             snapshot: Arc::new(GridSnapshot {
                 rows: rows as usize,
                 cols: cols as usize,
@@ -106,6 +110,46 @@ impl TerminalView {
         .detach();
     }
 
+    /// 实测等宽字体的单字符 advance。首次调用后缓存,字体不变则不再 shape。
+    /// 不用硬编码 CELL_WIDTH 的原因:不同平台字体(Consolas/monospace)与字号的实际 advance
+    /// 与 8px 有偏差,网格列按 8px 排布会让背景块与文本错位(表现为空格过宽)。
+    fn measure_cell_width(&mut self, window: &mut Window) {
+        // 只测一次:cell_width 与 CELL_WIDTH 相等说明尚未测量
+        if self.cell_width != CELL_WIDTH {
+            return;
+        }
+        let text_run = gpui::TextRun {
+            len: 1,
+            font: font(term_platform::platform_info().default_font_family),
+            color: rgb(0xffffff).into(),
+            background_color: None,
+            underline: None,
+            strikethrough: None,
+        };
+        let shaped = window.text_system().shape_line(
+            SharedString::from("M"),
+            px(FONT_SIZE),
+            &[text_run],
+            None,
+        );
+        // ShapedLine Deref 到 LineLayout,width 为 pub
+        let w: f32 = shaped.width.into();
+        if w > 0.0 {
+            self.cell_width = w;
+            // 列宽变了,重新按新宽度计算网格尺寸并同步 PTY
+            let width: f32 = window.viewport_size().width.into();
+            self.cols = ((width / w).floor() as u16).max(2);
+            self.session.resize(self.cols, self.rows);
+            {
+                let mut term = self.session.term.lock();
+                term.resize(alacritty_terminal::term::test::TermSize {
+                    columns: self.cols as usize,
+                    screen_lines: self.rows as usize,
+                });
+            }
+        }
+    }
+
     /// 不变量 2:锁内只取快照,立即释放。
     fn refresh_snapshot(&mut self) {
         let guard = self.session.term.lock();
@@ -120,7 +164,7 @@ impl TerminalView {
         let width: f32 = vp.width.into();
         let height: f32 = vp.height.into();
         // alacritty 限制:MIN_COLUMNS=2,可见行至少 1
-        let new_cols = ((width / CELL_WIDTH).floor() as u16).max(2);
+        let new_cols = ((width / self.cell_width).floor() as u16).max(2);
         let new_rows = ((height / CELL_HEIGHT).floor() as u16).max(1);
         if new_cols != self.cols || new_rows != self.rows {
             self.cols = new_cols;
@@ -178,9 +222,11 @@ impl Render for TerminalView {
     fn render(&mut self, window: &mut Window, cx: &mut Context<Self>) -> impl IntoElement {
         // PTY 事件由 spawn_event_loop 的常驻任务驱动重绘;render 只处理视口尺寸变化
         self.sync_size(window, cx);
+        self.measure_cell_width(window);
 
         let snapshot = Arc::clone(&self.snapshot);
         let focus = self.focus.clone();
+        let cell_width = self.cell_width;
 
         div()
             .id("terminal-root")
@@ -196,7 +242,7 @@ impl Render for TerminalView {
                     |_bounds, _window, _cx| {},
                     // paint:逐行绘制文本 run(相邻同样式单元格已合并)
                     move |bounds, (), window, cx| {
-                        paint_grid(&snapshot, bounds, window, cx);
+                        paint_grid(&snapshot, cell_width, bounds, window, cx);
                     },
                 )
                 .size_full(),
@@ -205,7 +251,14 @@ impl Render for TerminalView {
 }
 
 /// 绘制网格:先背景块,再文本,最后光标。所有数据来自快照,无锁。
-fn paint_grid(snapshot: &GridSnapshot, bounds: Bounds<Pixels>, window: &mut Window, cx: &mut App) {
+/// cell_width 为实测单字符 advance,保证背景块列宽与文本 advance 一致。
+fn paint_grid(
+    snapshot: &GridSnapshot,
+    cell_width: f32,
+    bounds: Bounds<Pixels>,
+    window: &mut Window,
+    cx: &mut App,
+) {
     window.paint_quad(fill(bounds, rgb(0x101010)));
 
     let font_family = term_platform::platform_info().default_font_family;
@@ -213,8 +266,8 @@ fn paint_grid(snapshot: &GridSnapshot, bounds: Bounds<Pixels>, window: &mut Wind
     for (row_idx, runs) in snapshot.rows_runs.iter().enumerate() {
         let y = bounds.origin.y + px(row_idx as f32 * CELL_HEIGHT);
         for run in runs {
-            let x = bounds.origin.x + px(run.start_col as f32 * CELL_WIDTH);
-            let width = px(run.text.chars().count() as f32 * CELL_WIDTH);
+            let x = bounds.origin.x + px(run.start_col as f32 * cell_width);
+            let width = px(run.text.chars().count() as f32 * cell_width);
 
             // 背景色块(仅当非默认背景时画)
             if run.style.bg != crate::grid::DEFAULT_BG {
@@ -253,10 +306,10 @@ fn paint_grid(snapshot: &GridSnapshot, bounds: Bounds<Pixels>, window: &mut Wind
     if let Some((row, col)) = snapshot.cursor {
         let cursor_bounds = Bounds::new(
             Point::new(
-                bounds.origin.x + px(col as f32 * CELL_WIDTH),
+                bounds.origin.x + px(col as f32 * cell_width),
                 bounds.origin.y + px(row as f32 * CELL_HEIGHT),
             ),
-            size(px(CELL_WIDTH), px(CELL_HEIGHT)),
+            size(px(cell_width), px(CELL_HEIGHT)),
         );
         window.paint_quad(fill(cursor_bounds, gpui::hsla(0.0, 0.0, 0.9, 0.35)));
     }
