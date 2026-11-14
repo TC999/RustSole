@@ -156,6 +156,7 @@ impl TerminalView {
 
         if let Some(bytes) = encode_key(
             &keystroke.key,
+            keystroke.key_char.as_deref(),
             m.control,
             m.alt,
             m.shift,

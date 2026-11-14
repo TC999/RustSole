@@ -11,13 +11,15 @@ pub struct KeyState {
 
 /// 编码一个按键。
 ///
-/// key:GPUI 的键名(如 "a"、"enter"、"up");ctrl/alt/shift:修饰键状态。
-/// 返回 None 表示该按键组合不产生输出(例如纯 Shift 按键)。
+/// key:GPUI 的键名(如 "a"、"space"、"up");key_char:平台给出的该次按键产生的字符
+/// (gpui Keystroke::key_char;Shift/CapsLock 下字母为大写,Shift 下标点为上档字符,无则 None)。
+/// ctrl/alt/shift:修饰键状态。返回 None 表示该按键组合不产生输出(例如纯修饰键按键)。
 ///
 /// KEY-004:Ctrl+C 在此函数层面编码为 0x03(中断字符),复制功能由快捷键绑定走别的 Action,
 /// 不会进入本函数。
 pub fn encode_key(
     key: &str,
+    key_char: Option<&str>,
     ctrl: bool,
     alt: bool,
     shift: bool,
@@ -67,8 +69,15 @@ pub fn encode_key(
         ("f2", false, _) => Some(b"\x1bOQ".to_vec()),
         ("f3", false, _) => Some(b"\x1bOR".to_vec()),
         ("f4", false, _) => Some(b"\x1bOS".to_vec()),
-        // 单个可打印字符(修饰键不含 ctrl/alt 时由 key_char 路径处理,这里兜底)
-        (k, false, _) if k.len() == 1 => Some(k.as_bytes().to_vec()),
+        // 单字符键:优先用 key_char(还原 Shift/CapsLock 产生的真实字符:大写字母、上档标点),
+        // 无 key_char 时回退键名(key 名对单字符键就是小写字符)
+        (k, false, _) if k.len() == 1 => {
+            let ch = key_char
+                .and_then(|s| s.chars().next())
+                .filter(|c| !c.is_control())
+                .unwrap_or_else(|| k.chars().next().expect("len==1 保证非空"));
+            Some(ch.to_string().into_bytes())
+        },
         _ => None,
     };
 
@@ -87,19 +96,19 @@ mod tests {
     fn key_005_app_cursor_sequences() {
         let st = KeyState { app_cursor: true };
         assert_eq!(
-            encode_key("up", false, false, false, st).unwrap(),
+            encode_key("up", None, false, false, false, st).unwrap(),
             b"\x1bOA"
         );
         assert_eq!(
-            encode_key("down", false, false, false, st).unwrap(),
+            encode_key("down", None, false, false, false, st).unwrap(),
             b"\x1bOB"
         );
         assert_eq!(
-            encode_key("right", false, false, false, st).unwrap(),
+            encode_key("right", None, false, false, false, st).unwrap(),
             b"\x1bOC"
         );
         assert_eq!(
-            encode_key("left", false, false, false, st).unwrap(),
+            encode_key("left", None, false, false, false, st).unwrap(),
             b"\x1bOD"
         );
     }
@@ -109,19 +118,19 @@ mod tests {
     fn key_005_normal_cursor_sequences() {
         let st = KeyState::default();
         assert_eq!(
-            encode_key("up", false, false, false, st).unwrap(),
+            encode_key("up", None, false, false, false, st).unwrap(),
             b"\x1b[A"
         );
         assert_eq!(
-            encode_key("down", false, false, false, st).unwrap(),
+            encode_key("down", None, false, false, false, st).unwrap(),
             b"\x1b[B"
         );
         assert_eq!(
-            encode_key("right", false, false, false, st).unwrap(),
+            encode_key("right", None, false, false, false, st).unwrap(),
             b"\x1b[C"
         );
         assert_eq!(
-            encode_key("left", false, false, false, st).unwrap(),
+            encode_key("left", None, false, false, false, st).unwrap(),
             b"\x1b[D"
         );
     }
@@ -130,7 +139,7 @@ mod tests {
     #[test]
     fn key_004_ctrl_c_is_interrupt() {
         assert_eq!(
-            encode_key("c", true, false, false, KeyState::default()).unwrap(),
+            encode_key("c", None, true, false, false, KeyState::default()).unwrap(),
             vec![0x03]
         );
     }
@@ -139,11 +148,11 @@ mod tests {
     #[test]
     fn ctrl_letters_to_control_chars() {
         assert_eq!(
-            encode_key("a", true, false, false, KeyState::default()).unwrap(),
+            encode_key("a", None, true, false, false, KeyState::default()).unwrap(),
             vec![0x01]
         );
         assert_eq!(
-            encode_key("d", true, false, false, KeyState::default()).unwrap(),
+            encode_key("d", None, true, false, false, KeyState::default()).unwrap(),
             vec![0x04]
         );
     }
@@ -152,15 +161,15 @@ mod tests {
     #[test]
     fn basic_keys() {
         let st = KeyState::default();
-        assert_eq!(encode_key("enter", false, false, false, st).unwrap(), b"\r");
+        assert_eq!(encode_key("enter", None, false, false, false, st).unwrap(), b"\r");
         assert_eq!(
-            encode_key("backspace", false, false, false, st).unwrap(),
+            encode_key("backspace", None, false, false, false, st).unwrap(),
             vec![0x7f]
         );
-        assert_eq!(encode_key("tab", false, false, false, st).unwrap(), b"\t");
+        assert_eq!(encode_key("tab", None, false, false, false, st).unwrap(), b"\t");
         // Shift+Tab 反向制表
         assert_eq!(
-            encode_key("tab", false, false, true, st).unwrap(),
+            encode_key("tab", None, false, false, true, st).unwrap(),
             b"\x1b[Z"
         );
     }
@@ -169,25 +178,51 @@ mod tests {
     #[test]
     fn alt_prefixes_esc() {
         let st = KeyState::default();
-        assert_eq!(encode_key("x", false, true, false, st).unwrap(), b"\x1bx");
+        assert_eq!(encode_key("x", None, false, true, false, st).unwrap(), b"\x1bx");
     }
 
     /// 空格键(gpui 命名 "space")→ 0x20
     #[test]
     fn space_key_sends_0x20() {
         let st = KeyState::default();
-        assert_eq!(encode_key("space", false, false, false, st).unwrap(), vec![0x20]);
+        assert_eq!(encode_key("space", None, false, false, false, st).unwrap(), vec![0x20]);
         // Alt+Space 前缀 ESC
-        assert_eq!(encode_key("space", false, true, false, st).unwrap(), b"\x1b ");
+        assert_eq!(encode_key("space", None, false, true, false, st).unwrap(), b"\x1b ");
+    }
+
+    /// Shift/CapsLock 下字母用 key_char 的大写(修复:此前总输出小写)
+    #[test]
+    fn uppercase_via_key_char() {
+        let st = KeyState::default();
+        assert_eq!(
+            encode_key("a", Some("A"), false, false, true, st).unwrap(),
+            b"A"
+        );
+        // 无 shift 且无 key_char:回退键名小写
+        assert_eq!(
+            encode_key("a", None, false, false, false, st).unwrap(),
+            b"a"
+        );
+    }
+
+    /// Shift+标点用 key_char 的上档字符
+    #[test]
+    fn shifted_punct_via_key_char() {
+        let st = KeyState::default();
+        // Shift+, 在 US 布局产生 "<"
+        assert_eq!(
+            encode_key(",", Some("<"), false, false, true, st).unwrap(),
+            b"<"
+        );
     }
 
     /// 不产生输出的组合返回 None
     #[test]
     fn no_output_combinations() {
         let st = KeyState::default();
-        assert_eq!(encode_key("shift", false, false, true, st), None);
+        assert_eq!(encode_key("shift", None, false, false, true, st), None);
         assert_eq!(
-            encode_key("unknown-mediacmd", false, false, false, st),
+            encode_key("unknown-mediacmd", None, false, false, false, st),
             None
         );
     }
