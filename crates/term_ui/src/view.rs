@@ -184,7 +184,7 @@ impl TerminalView {
     }
 
     /// 处理键盘输入:编码并发送(KEY-004/KEY-005)。
-    fn handle_key(&mut self, event: &KeyDownEvent, cx: &mut Context<Self>) {
+    fn handle_key(&mut self, event: &KeyDownEvent, window: &mut Window, cx: &mut Context<Self>) {
         let keystroke = &event.keystroke;
         let m = &keystroke.modifiers;
 
@@ -204,7 +204,11 @@ impl TerminalView {
             m.control,
             m.alt,
             m.shift,
-            KeyState { app_cursor },
+            KeyState {
+                app_cursor,
+                // gpui Windows 的 key_char 不反映 CapsLock,用窗口缓存的状态补偿
+                caps_lock: window.capslock().on,
+            },
         ) {
             self.session.write(&bytes);
             cx.notify();
@@ -233,8 +237,8 @@ impl Render for TerminalView {
             .size_full()
             .bg(rgb(0x101010))
             .track_focus(&focus)
-            .on_key_down(cx.listener(|view, event: &KeyDownEvent, _window, cx| {
-                view.handle_key(event, cx);
+            .on_key_down(cx.listener(|view, event: &KeyDownEvent, window, cx| {
+                view.handle_key(event, window, cx);
             }))
             .child(
                 canvas(

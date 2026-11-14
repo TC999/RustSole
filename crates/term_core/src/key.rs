@@ -7,6 +7,9 @@
 pub struct KeyState {
     /// 程序开启应用光标键模式(DECOM DECCKM,TermMode::APP_CURSOR)。
     pub app_cursor: bool,
+    /// CapsLock 开启。注意:gpui Windows 的 key_char 不反映 CapsLock
+    /// (generate_key_char 的 ToUnicode 状态表缺 VK_CAPITAL 位),需要在此补偿。
+    pub caps_lock: bool,
 }
 
 /// 编码一个按键。
@@ -69,13 +72,25 @@ pub fn encode_key(
         ("f2", false, _) => Some(b"\x1bOQ".to_vec()),
         ("f3", false, _) => Some(b"\x1bOR".to_vec()),
         ("f4", false, _) => Some(b"\x1bOS".to_vec()),
-        // 单字符键:优先用 key_char(还原 Shift/CapsLock 产生的真实字符:大写字母、上档标点),
+        // 单字符键:优先用 key_char(还原 Shift 产生的真实字符:大写字母、上档标点),
         // 无 key_char 时回退键名(key 名对单字符键就是小写字符)
         (k, false, _) if k.len() == 1 => {
             let ch = key_char
                 .and_then(|s| s.chars().next())
                 .filter(|c| !c.is_control())
                 .unwrap_or_else(|| k.chars().next().expect("len==1 保证非空"));
+            // CapsLock 补偿:gpui Windows 的 key_char 只反映 Shift 不反映 CapsLock,
+            // 期望输出 = shift XOR caps ? 大写 : 小写(仅 ASCII 字母;标点不受 CapsLock 影响)。
+            // 对 key_char 已反映 CapsLock 的平台(macOS/Linux),该变换幂等:大写 upper 后仍大写。
+            let ch = if state.caps_lock && ch.is_ascii_alphabetic() {
+                if shift {
+                    ch.to_ascii_lowercase()
+                } else {
+                    ch.to_ascii_uppercase()
+                }
+            } else {
+                ch
+            };
             Some(ch.to_string().into_bytes())
         },
         _ => None,
@@ -94,7 +109,10 @@ mod tests {
     /// KEY-005:方向键在 APP_CURSOR 下发 ESC O A/B/C/D
     #[test]
     fn key_005_app_cursor_sequences() {
-        let st = KeyState { app_cursor: true };
+        let st = KeyState {
+            app_cursor: true,
+            ..Default::default()
+        };
         assert_eq!(
             encode_key("up", None, false, false, false, st).unwrap(),
             b"\x1bOA"
@@ -213,6 +231,46 @@ mod tests {
         assert_eq!(
             encode_key(",", Some("<"), false, false, true, st).unwrap(),
             b"<"
+        );
+    }
+
+    /// CapsLock 开:无 shift 字母变大写(修复:gpui Windows key_char 不反映 CapsLock)
+    #[test]
+    fn capslock_uppercases_letters() {
+        let st = KeyState {
+            caps_lock: true,
+            ..Default::default()
+        };
+        // gpui 给的 key_char 是小写(缺 caps 位),编码后应为大写
+        assert_eq!(
+            encode_key("a", Some("a"), false, false, false, st).unwrap(),
+            b"A"
+        );
+    }
+
+    /// CapsLock 开 + Shift:字母变小写(标准键盘行为)
+    #[test]
+    fn capslock_with_shift_lowercases() {
+        let st = KeyState {
+            caps_lock: true,
+            ..Default::default()
+        };
+        assert_eq!(
+            encode_key("a", Some("A"), false, false, true, st).unwrap(),
+            b"a"
+        );
+    }
+
+    /// CapsLock 不影响标点与数字
+    #[test]
+    fn capslock_ignores_non_letters() {
+        let st = KeyState {
+            caps_lock: true,
+            ..Default::default()
+        };
+        assert_eq!(
+            encode_key("1", Some("1"), false, false, false, st).unwrap(),
+            b"1"
         );
     }
 
