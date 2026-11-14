@@ -7,8 +7,8 @@ use gpui::prelude::*;
 use gpui::{
     canvas, div, fill, font, px, rgb, size, App, Bounds, Context, ElementInputHandler, Entity,
     EntityInputHandler, FocusHandle, Focusable, IntoElement, KeyDownEvent, MouseButton,
-    MouseDownEvent, MouseMoveEvent, Pixels, Point, Render, ScrollWheelEvent, SharedString,
-    UTF16Selection, Window,
+    MouseDownEvent, MouseMoveEvent, Pixels, Point, Render, ScrollDelta, ScrollWheelEvent,
+    SharedString, UTF16Selection, Window,
 };
 
 use alacritty_terminal::grid::{Dimensions as _, Scroll};
@@ -52,6 +52,8 @@ pub struct TerminalView {
     scroll_drag: Option<ScrollDrag>,
     /// 最近一次视口高度(px),滚动条几何需要。
     viewport_height: f32,
+    /// 滚轮不足一行的余量(f32 行)。触控板的精确增量需要累积,否则小数部分被截断会无响应。
+    scroll_remainder: f32,
     /// 滚动条渲染状态(thumb 回看比例),事件与渲染共享。
     scrollbar_state: Arc<std::sync::Mutex<ScrollbarState>>,
     /// 待渲染快照(Wakeup 时刷新)。
@@ -80,6 +82,7 @@ impl TerminalView {
             ime_composing: false,
             scroll_drag: None,
             viewport_height: 0.0,
+            scroll_remainder: 0.0,
             scrollbar_state: Arc::new(std::sync::Mutex::new(ScrollbarState {
                 offset_ratio: 0.0,
             })),
@@ -139,6 +142,35 @@ impl TerminalView {
             }
         })
         .detach();
+    }
+
+
+    /// 处理滚轮:向上滚 → 回看历史(display_offset 增大)。
+    ///
+    /// 符号依据(锁定版本源码):
+    /// - gpui Windows 把 WM_MOUSEWHEEL 的 zDelta 原样换算(events.rs:548-549),Windows 约定上滚为正;
+    /// - alacritty 的 Scroll::Delta(正数)使 display_offset 增大,即回看更早内容(grid/mod.rs:166)。
+    ///
+    /// 两者同号,因此直接把 delta 传入,不再取反。
+    fn handle_scroll_wheel(&mut self, event: &ScrollWheelEvent, cx: &mut Context<Self>) {
+        let lines = match event.delta {
+            // 精确像素增量(触控板):按单元格高度折算为行,余量累积避免小数丢失
+            ScrollDelta::Pixels(delta) => {
+                let y_px: f32 = delta.y.into();
+                y_px / CELL_HEIGHT
+            },
+            // 行增量(传统滚轮):直接使用
+            ScrollDelta::Lines(delta) => delta.y,
+        };
+
+        self.scroll_remainder += lines;
+        // 只取整行进位,余量留到下次(向零取整,保证方向单调)
+        let whole = self.scroll_remainder.trunc();
+        if whole == 0.0 {
+            return;
+        }
+        self.scroll_remainder -= whole;
+        self.scroll_lines(whole as i32, cx);
     }
 
     /// 滚动条按下:命中 thumb 区域时开始拖动,否则跳转到点击位置。
@@ -411,13 +443,7 @@ impl Render for TerminalView {
             }))
             // 终端画布区:滚轮回看历史
             .on_scroll_wheel(cx.listener(|view, event: &ScrollWheelEvent, _window, cx| {
-                let delta = event.delta.pixel_delta(px(CELL_HEIGHT));
-                // 滚轮像素 delta 换算行数;负值(上滚)→ 回看
-                let y_px: f32 = delta.y.into();
-                let lines_f = (y_px / CELL_HEIGHT) as i32;
-                if lines_f != 0 {
-                    view.scroll_lines(-lines_f, cx);
-                }
+                view.handle_scroll_wheel(event, cx);
             }))
             .child(
                 div()
