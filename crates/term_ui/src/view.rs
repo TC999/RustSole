@@ -1,12 +1,13 @@
 //! 终端视图:单窗口单终端(阶段 1)。
 //! 输入采集与渲染在这里;快照提取在锁内、绘制在锁外(ARCHITECTURE.md 不变量 2/8)。
 
+use std::rc::Rc;
 use std::sync::Arc;
 
 use gpui::prelude::*;
 use gpui::{
-    canvas, div, fill, font, px, rgb, size, App, Bounds, Context, ElementInputHandler, Entity,
-    EntityInputHandler, FocusHandle, Focusable, IntoElement, KeyDownEvent, MouseButton,
+    canvas, div, fill, font, px, rgb, size, App, Bounds, ClickEvent, Context, ElementInputHandler,
+    Entity, EntityInputHandler, FocusHandle, Focusable, IntoElement, KeyDownEvent, MouseButton,
     MouseDownEvent, MouseMoveEvent, Pixels, Point, Render, ScrollDelta, ScrollWheelEvent,
     SharedString, UTF16Selection, Window,
 };
@@ -18,6 +19,8 @@ use term_core::proxy::TermEventMsg;
 use term_core::session::Session;
 
 use crate::grid::{ratio_to_offset, snapshot, thumb_ratio, GridSnapshot};
+use crate::theme::{terminal, window as window_theme, WindowControl, WindowControlsShown};
+use crate::titlebar::{render_titlebar, TitlebarHandlers, TitlebarModel};
 
 /// 单元格像素尺寸(阶段 1 固定值,随 HiDPI 缩放由 GPUI 处理)。
 pub const CELL_WIDTH: f32 = 8.0;
@@ -61,6 +64,10 @@ pub struct TerminalView {
     scrollbar_state: Arc<std::sync::Mutex<ScrollbarState>>,
     /// 待渲染快照(Wakeup 时刷新)。
     snapshot: Arc<GridSnapshot>,
+    /// 窗口标题(标题栏文字;程序通过 OSC 0/2 设置标题时更新)。
+    title: SharedString,
+    /// 标题栏上当前悬停的控制按钮(None = 不在任何一个按钮上)。
+    hovered_control: Option<WindowControl>,
 }
 
 impl TerminalView {
@@ -86,9 +93,7 @@ impl TerminalView {
             scroll_drag: None,
             viewport_height: 0.0,
             scroll_remainder: 0.0,
-            scrollbar_state: Arc::new(std::sync::Mutex::new(ScrollbarState {
-                offset_ratio: 0.0,
-            })),
+            scrollbar_state: Arc::new(std::sync::Mutex::new(ScrollbarState { offset_ratio: 0.0 })),
             snapshot: Arc::new(GridSnapshot {
                 rows: rows as usize,
                 cols: cols as usize,
@@ -96,6 +101,8 @@ impl TerminalView {
                 cursor: None,
                 display_offset: 0,
             }),
+            title: SharedString::from("RustSole"),
+            hovered_control: None,
         });
 
         // 事件驱动重绘:后台任务把 PTY 事件合并后唤醒主线程(不变量 4:约 8ms 合并)
@@ -118,11 +125,14 @@ impl TerminalView {
                 let taken = events.drain();
                 let mut had_wakeup = false;
                 let mut pty_writes: Vec<String> = Vec::new();
+                let mut new_title: Option<String> = None;
                 for msg in taken {
                     match msg {
                         TermEventMsg::Wakeup | TermEventMsg::Exited => had_wakeup = true,
                         TermEventMsg::PtyWrite(s) => pty_writes.push(s),
-                        TermEventMsg::Title(_) | TermEventMsg::Other => {},
+                        // OSC 0/2 设置的窗口标题:只保留最后一个,由主线程应用到标题栏
+                        TermEventMsg::Title(t) => new_title = Some(t),
+                        TermEventMsg::Other => {}
                     }
                 }
 
@@ -131,6 +141,14 @@ impl TerminalView {
                         // 程序应答序列写回 PTY
                         for s in &pty_writes {
                             view.session.write(s.as_bytes());
+                        }
+                        if let Some(t) = new_title {
+                            // 标题是用户可见状态:只在真的变化时刷新,避免每帧重绘标题栏
+                            let title = SharedString::from(t);
+                            if view.title != title {
+                                view.title = title;
+                                had_wakeup = true;
+                            }
                         }
                         if had_wakeup {
                             view.refresh_snapshot();
@@ -147,7 +165,6 @@ impl TerminalView {
         .detach();
     }
 
-
     /// 处理滚轮:向上滚 → 回看历史(display_offset 增大)。
     ///
     /// 符号依据(锁定版本源码):
@@ -161,7 +178,7 @@ impl TerminalView {
             ScrollDelta::Pixels(delta) => {
                 let y_px: f32 = delta.y.into();
                 y_px / CELL_HEIGHT
-            },
+            }
             // 行增量(传统滚轮):直接使用
             ScrollDelta::Lines(delta) => delta.y,
         };
@@ -289,9 +306,11 @@ impl TerminalView {
         let w: f32 = shaped.width.into();
         if w > 0.0 {
             self.cell_width = w;
-            // 列宽变了,重新按新宽度计算网格尺寸并同步 PTY
+            // 列宽变了,重新按新宽度计算网格尺寸并同步 PTY。
+            // 算法必须与 sync_size 保持一致(同样扣掉滚动条轨道宽度),否则首次测量后
+            // 会先按整幅宽度算出偏多的列数,下一帧再被 sync_size 改回来,窗口一开就抖动。
             let width: f32 = window.viewport_size().width.into();
-            self.cols = ((width / w).floor() as u16).max(2);
+            self.cols = (((width - SCROLLBAR_WIDTH) / w).floor() as u16).max(2);
             self.session.resize(self.cols, self.rows);
             {
                 let mut term = self.session.term.lock();
@@ -311,7 +330,10 @@ impl TerminalView {
             // 没有历史,滚动无意义
             return;
         }
-        { let mut term = self.session.term.lock(); term.scroll_display(Scroll::Delta(delta)); }
+        {
+            let mut term = self.session.term.lock();
+            term.scroll_display(Scroll::Delta(delta));
+        }
         self.refresh_scrollbar_state();
         self.refresh_snapshot();
         cx.notify();
@@ -319,7 +341,8 @@ impl TerminalView {
 
     /// 把 display_offset 直接设置到目标值(点击/拖动滚动条用),带钳制。锁内一次完成。
     fn set_display_offset(&mut self, target: i32, cx: &mut Context<Self>) {
-        { let mut term = self.session.term.lock();
+        {
+            let mut term = self.session.term.lock();
             let history = term.grid().history_size();
             if history == 0 {
                 return;
@@ -357,7 +380,9 @@ impl TerminalView {
     fn sync_size(&mut self, window: &mut Window, cx: &mut Context<Self>) {
         let vp = window.viewport_size();
         let width: f32 = vp.width.into();
-        let height: f32 = vp.height.into();
+        // 视口高度里扣掉自绘标题栏:终端网格只占标题栏以下的区域(WIN-001)。
+        // 若不扣,最后一行会被标题栏遮住,且 `stty size` 比可见行数多 2 行左右。
+        let height: f32 = (f32::from(vp.height) - crate::theme::TITLEBAR_HEIGHT).max(0.0);
         // 扣掉滚动条轨道宽度(列数按终端画布实际可用宽度算)
         // alacritty 限制:MIN_COLUMNS=2,可见行至少 1
         let new_cols = (((width - SCROLLBAR_WIDTH) / self.cell_width).floor() as u16).max(2);
@@ -437,36 +462,85 @@ impl Render for TerminalView {
         let cell_width = self.cell_width;
         let this = cx.entity();
 
+        let titlebar = render_titlebar(
+            &TitlebarModel {
+                title: self.title.clone(),
+                maximized: window.is_maximized(),
+                focused: window.is_window_active(),
+                controls: WindowControlsShown {
+                    minimize: true,
+                    maximize: true,
+                },
+                hovered: self.hovered_control,
+            },
+            TitlebarHandlers {
+                drag: Rc::new(cx.listener(
+                    |_view, _event: &MouseDownEvent, window: &mut Window, _cx| {
+                        start_window_drag(window);
+                    },
+                )),
+                double_click: Rc::new(cx.listener(
+                    |_view, _event: &ClickEvent, window: &mut Window, _cx| {
+                        toggle_maximize(window);
+                    },
+                )),
+                control: Rc::new(cx.listener(
+                    |_view, kind: &WindowControl, window: &mut Window, _cx| {
+                        apply_window_control(*kind, window);
+                    },
+                )),
+                hover: Rc::new(cx.listener(
+                    |view, hovered: &Option<WindowControl>, _window, cx| {
+                        if view.hovered_control != *hovered {
+                            view.hovered_control = *hovered;
+                            cx.notify();
+                        }
+                    },
+                )),
+            },
+            f32::from(window.viewport_size().width),
+        );
+
         div()
             .id("terminal-root")
             .size_full()
-            .bg(rgb(0x101010))
+            .flex()
+            .flex_col()
+            .bg(rgb(window_theme::WINDOW_BG))
             .track_focus(&focus)
             .on_key_down(cx.listener(|view, event: &KeyDownEvent, window, cx| {
                 view.handle_key(event, window, cx);
             }))
-            // 终端画布区:滚轮回看历史
-            .on_scroll_wheel(cx.listener(|view, event: &ScrollWheelEvent, _window, cx| {
-                view.handle_scroll_wheel(event, cx);
-            }))
+            .child(titlebar)
             .child(
+                // 终端内容区:滚轮回看历史
                 div()
-                    .size_full()
+                    .id("terminal-body")
+                    .flex_1()
+                    .w_full()
                     .flex()
+                    .overflow_hidden()
+                    .on_scroll_wheel(cx.listener(|view, event: &ScrollWheelEvent, _window, cx| {
+                        view.handle_scroll_wheel(event, cx);
+                    }))
                     .child(
-                        canvas(
-                            |_bounds, _window, _cx| {},
-                            move |bounds, (), window, cx| {
-                                // 注册 IME 输入处理器(paint 阶段必须;焦点在终端时平台才会投递组合文本)
-                                window.handle_input(
-                                    &focus,
-                                    ElementInputHandler::new(bounds, this),
-                                    cx,
-                                );
-                                paint_grid(&snapshot, cell_width, bounds, window, cx);
-                            },
-                        )
-                        .size_full(),
+                        // 画布占据滚动条以外的宽度:`flex_1` 而不是 `size_full`,
+                        // 否则 canvas 会按整行宽度布局,把滚动条挤出可视区。
+                        div().flex_1().h_full().child(
+                            canvas(
+                                |_bounds, _window, _cx| {},
+                                move |bounds, (), window, cx| {
+                                    // 注册 IME 输入处理器(paint 阶段必须;焦点在终端时平台才会投递组合文本)
+                                    window.handle_input(
+                                        &focus,
+                                        ElementInputHandler::new(bounds, this),
+                                        cx,
+                                    );
+                                    paint_grid(&snapshot, cell_width, bounds, window, cx);
+                                },
+                            )
+                            .size_full(),
+                        ),
                     )
                     .child(scrollbar_element(
                         Arc::clone(&self.scrollbar_state),
@@ -478,6 +552,50 @@ impl Render for TerminalView {
                         }),
                     )),
             )
+    }
+}
+
+/// 标题栏拖动区按下。
+///
+/// - Linux(X11/Wayland):gpui 的 `WindowControlArea` 命中框不参与平台拖动,
+///   必须显式调用 `Window::start_window_move`。
+/// - Windows:依赖 `WindowControlArea::Drag` → HTCAPTION,由系统接管;
+///   `start_window_move` 在 Windows 上是空实现,因此这里跳过。
+///
+/// 注意:Windows 的 HTCAPTION 路径在本次开发环境中因无法把窗口切到前台而**未能验证**
+/// (见汇报),需要在真实交互下确认。
+fn start_window_drag(window: &mut Window) {
+    if term_platform::window_chrome() == term_platform::WindowChrome::AppHandled {
+        window.start_window_move();
+    }
+}
+
+/// 最大化/还原切换(双击标题栏与最大化按钮共用)。
+///
+/// 两平台都调用 `Window::zoom_window`,但语义不同:
+/// - X11/Wayland:`zoom()` 本身就是切换(gpui `platform/linux/*/window.rs`)。
+/// - Windows:`zoom()` 只会 `SW_MAXIMIZE`,而 gpui 0.2.2 没有公开的还原 API,
+///   因此已最大化时这里是空操作(见汇报"受限"一节)。
+fn toggle_maximize(window: &mut Window) {
+    match term_platform::window_chrome() {
+        term_platform::WindowChrome::AppHandled => window.zoom_window(),
+        term_platform::WindowChrome::SystemHandled => {
+            if !window.is_maximized() {
+                window.zoom_window();
+            }
+        }
+    }
+}
+
+/// 执行标题栏按钮动作。
+///
+/// 注意:即便按钮上设置了 `WindowControlArea`,Windows 的 NC 命中测试路径在本环境实测未生效
+/// (见汇报),因此这里统一由应用侧调用 `Window` 方法,保证按钮在两平台都可用。
+fn apply_window_control(kind: WindowControl, window: &mut Window) {
+    match kind {
+        WindowControl::Minimize => window.minimize_window(),
+        WindowControl::Maximize => toggle_maximize(window),
+        WindowControl::Close => window.remove_window(),
     }
 }
 
@@ -495,7 +613,7 @@ fn scrollbar_element(
 ) -> gpui::AnyElement {
     div()
         .w(px(SCROLLBAR_WIDTH))
-        .bg(rgb(0x181818))
+        .bg(rgb(terminal::SCROLLBAR_TRACK))
         .child(
             canvas(
                 // prepaint:thumb 位置由状态决定
@@ -524,7 +642,7 @@ fn paint_scrollbar(bounds: Bounds<Pixels>, thumb_ratio_value: f32, window: &mut 
         Point::new(bounds.origin.x, bounds.origin.y + px(thumb_top)),
         size(px(SCROLLBAR_WIDTH), px(thumb_h)),
     );
-    window.paint_quad(fill(thumb_bounds, rgb(0x555555)));
+    window.paint_quad(fill(thumb_bounds, rgb(terminal::SCROLLBAR_THUMB)));
 }
 
 /// 绘制网格:先背景块,再文本,最后光标。所有数据来自快照,无锁。
@@ -536,7 +654,7 @@ fn paint_grid(
     window: &mut Window,
     cx: &mut App,
 ) {
-    window.paint_quad(fill(bounds, rgb(0x101010)));
+    window.paint_quad(fill(bounds, rgb(terminal::BG)));
 
     let font_family = term_platform::platform_info().default_font_family;
 
