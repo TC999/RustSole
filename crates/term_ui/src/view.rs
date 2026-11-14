@@ -454,7 +454,11 @@ impl TerminalView {
         }
     }
 
-    /// 处理键盘输入:编码并发送(KEY-004/KEY-005)。
+    /// 处理键盘输入(KEY-004/KEY-005)。
+    ///
+    /// 分流规则:可打印字符键交给平台字符通道(Windows 为 TranslateMessage → WM_CHAR,
+    /// Linux 为平台层的 key_char fallback),这样输入法组合才能正常工作;控制键与
+    /// Ctrl/Alt 组合由 encode_key 编码为终端序列直接写入 PTY。
     fn handle_key(&mut self, event: &KeyDownEvent, window: &mut Window, cx: &mut Context<Self>) {
         // IME 组合中的按键已被输入法拦截(VK_PROCESSKEY),gpui 仍会发原始键的 KeyDown,
         // 这里必须丢弃,否则拼音字母与提交后的汉字会双写进 PTY。
@@ -466,6 +470,18 @@ impl TerminalView {
 
         // Ctrl+Shift 组合保留给应用快捷键(Ctrl+Shift+C/V 等),不进编码器
         if m.control && m.shift {
+            return;
+        }
+
+        // 可打印字符键(无 Ctrl/Alt 修饰,含空格):不在此编码进 PTY。让事件继续传播,
+        // 由 gpui 对未处理 KeyDown 调用 TranslateMessage 生成 WM_CHAR,再经
+        // handle_char_msg → replace_text_in_range 写入。这是输入法正常工作的前提:
+        // 组合第一个键(拼音字母)到达时 marked_text_range 仍为空,gpui 会派发 KeyDown;
+        // 若在此写入 PTY,字母会在输入法组合开始前漏进终端,表现为"无法输入汉字"。
+        // 交给 WM_CHAR 通道后,组合中的按键由输入法处理,提交的汉字经
+        // replace_text_in_range 写入,Shift/CapsLock 的大写也由 ToUnicode 正确反映。
+        let is_printable_key = keystroke.key.chars().count() == 1 || keystroke.key == "space";
+        if !m.control && !m.alt && is_printable_key {
             return;
         }
 
@@ -487,8 +503,9 @@ impl TerminalView {
             },
         ) {
             self.session.write(&bytes);
-            // 字符已由键盘编码路径处理:阻止传播,否则 gpui 对未处理事件调用 TranslateMessage
-            // 生成 WM_CHAR,handle_char_msg 会经 replace_text_in_range 把同一字符再写一次(双字母)
+            // 控制键已由键盘编码路径处理:阻止传播,避免 gpui 对未处理事件 TranslateMessage
+            // 生成 WM_CHAR 经 replace_text_in_range 重复写入。可打印字符键已在前面的
+            // 分支交给了 WM_CHAR 通道,不会走到这里。
             cx.stop_propagation();
             cx.notify();
         }
