@@ -6,10 +6,10 @@ use std::sync::Arc;
 
 use gpui::prelude::*;
 use gpui::{
-    canvas, div, fill, font, px, rgb, size, App, Bounds, ClickEvent, Context, ElementInputHandler,
-    Entity, EntityInputHandler, FocusHandle, Focusable, IntoElement, KeyDownEvent, MouseButton,
-    MouseDownEvent, MouseMoveEvent, Pixels, Point, Render, ScrollDelta, ScrollWheelEvent,
-    SharedString, UTF16Selection, Window,
+    canvas, div, fill, font, px, relative, rgb, size, App, Bounds, ClickEvent, Context,
+    ElementInputHandler, Entity, EntityInputHandler, FocusHandle, Focusable, IntoElement,
+    KeyDownEvent, MouseButton, MouseDownEvent, MouseMoveEvent, Pixels, Point, Render, ScrollDelta,
+    ScrollWheelEvent, SharedString, UTF16Selection, Window,
 };
 
 use alacritty_terminal::grid::{Dimensions as _, Scroll};
@@ -60,14 +60,16 @@ pub struct TerminalView {
     viewport_height: f32,
     /// 滚轮不足一行的余量(f32 行)。触控板的精确增量需要累积,否则小数部分被截断会无响应。
     scroll_remainder: f32,
-    /// 滚动条渲染状态(thumb 回看比例),事件与渲染共享。
-    scrollbar_state: Arc<std::sync::Mutex<ScrollbarState>>,
+    /// 滚动条 thumb 的回看比例(1.0 = 贴轨道底/最新内容,0.0 = 贴轨道顶/最旧内容)。
+    scrollbar_ratio: f32,
     /// 待渲染快照(Wakeup 时刷新)。
     snapshot: Arc<GridSnapshot>,
     /// 窗口标题(标题栏文字;程序通过 OSC 0/2 设置标题时更新)。
     title: SharedString,
     /// 标题栏上当前悬停的控制按钮(None = 不在任何一个按钮上)。
     hovered_control: Option<WindowControl>,
+    /// 窗口激活状态观察者(首次 render 时注册,见 render 中的说明)。
+    activation_subscription: Option<gpui::Subscription>,
 }
 
 impl TerminalView {
@@ -93,7 +95,7 @@ impl TerminalView {
             scroll_drag: None,
             viewport_height: 0.0,
             scroll_remainder: 0.0,
-            scrollbar_state: Arc::new(std::sync::Mutex::new(ScrollbarState { offset_ratio: 0.0 })),
+            scrollbar_ratio: 1.0,
             snapshot: Arc::new(GridSnapshot {
                 rows: rows as usize,
                 cols: cols as usize,
@@ -103,6 +105,7 @@ impl TerminalView {
             }),
             title: SharedString::from("RustSole"),
             hovered_control: None,
+            activation_subscription: None,
         });
 
         // 事件驱动重绘:后台任务把 PTY 事件合并后唤醒主线程(不变量 4:约 8ms 合并)
@@ -357,15 +360,12 @@ impl TerminalView {
     }
 
     /// 刷新滚动条 thumb 回看比例(display_offset / history)。
-    fn refresh_scrollbar_state(&self) {
+    fn refresh_scrollbar_state(&mut self) {
         let (history, offset) = {
             let term = self.session.term.lock();
             (term.grid().history_size(), term.grid().display_offset())
         };
-        let ratio = thumb_ratio(offset, history);
-        if let Ok(mut state) = self.scrollbar_state.lock() {
-            state.offset_ratio = ratio;
-        }
+        self.scrollbar_ratio = thumb_ratio(offset, history);
     }
 
     /// 不变量 2:锁内只取快照,立即释放。
@@ -387,6 +387,9 @@ impl TerminalView {
         // alacritty 限制:MIN_COLUMNS=2,可见行至少 1
         let new_cols = (((width - SCROLLBAR_WIDTH) / self.cell_width).floor() as u16).max(2);
         let new_rows = ((height / CELL_HEIGHT).floor() as u16).max(1);
+        // 滚动条几何(点击跳转/拖动)要用终端内容区的实际高度;这里就是它的来源。
+        // 此前该字段只初始化、从未赋值,导致轨道高度恒为 0,滚动条点击位置判断失效。
+        self.viewport_height = height;
         if new_cols != self.cols || new_rows != self.rows {
             self.cols = new_cols;
             self.rows = new_rows;
@@ -456,6 +459,22 @@ impl Render for TerminalView {
         // PTY 事件由 spawn_event_loop 的常驻任务驱动重绘;render 只处理视口尺寸变化
         self.sync_size(window, cx);
         self.measure_cell_width(window);
+
+        // 窗口从最小化恢复时,GPUI 那一帧的呈现可能不包含自绘内容,
+        // 表现为标题栏按钮与滚动条消失、点击其他窗口才恢复(用户实测)。
+        // 这里在窗口重新激活后延迟一小段再刷新一次,确保有一帧完整的重绘被提交。
+        if self.activation_subscription.is_none() {
+            let subscription = cx.observe_window_activation(window, |_view, window, cx| {
+                if window.is_window_active() {
+                    cx.spawn(async move |this, cx| {
+                        gpui::Timer::after(std::time::Duration::from_millis(120)).await;
+                        this.update(cx, |_, cx| cx.notify()).ok();
+                    })
+                    .detach();
+                }
+            });
+            self.activation_subscription = Some(subscription);
+        }
 
         let snapshot = Arc::clone(&self.snapshot);
         let focus = self.focus.clone();
@@ -542,7 +561,7 @@ impl Render for TerminalView {
                         ),
                     )
                     .child(scrollbar_element(
-                        Arc::clone(&self.scrollbar_state),
+                        self.scrollbar_ratio,
                         cx.listener(|view, event: &MouseDownEvent, _window, cx| {
                             view.scrollbar_mouse_down(event, cx);
                         }),
@@ -599,50 +618,38 @@ fn apply_window_control(kind: WindowControl, window: &mut Window) {
     }
 }
 
-/// 滚动条状态(跨事件与渲染共享):thumb 的回看比例 0..1。
-#[derive(Debug)]
-struct ScrollbarState {
-    offset_ratio: f32,
-}
-
-/// 滚动条元素:div 容器包 canvas(canvas 不实现 InteractiveElement,事件注册在 div 上)。
+/// 滚动条元素:轨道与 thumb 都用普通 `div`(相对定位),不经过 canvas。
+///
+/// 用 div 而不是 canvas 的原因与窗口按钮相同:窗口最小化后恢复时,canvas 自绘内容
+/// 可能不会重新提交给合成器,表现为滚动条与按钮一起消失、点其他窗口才恢复。
+///
+/// `ratio` 语义:1.0 = 贴轨道底(最新内容),0.0 = 贴轨道顶(最旧内容)。
 fn scrollbar_element(
-    state: Arc<std::sync::Mutex<ScrollbarState>>,
+    ratio: f32,
     mouse_down: impl Fn(&MouseDownEvent, &mut Window, &mut App) + 'static,
     mouse_move: impl Fn(&MouseMoveEvent, &mut Window, &mut App) + 'static,
 ) -> gpui::AnyElement {
+    let ratio = ratio.clamp(0.0, 1.0);
+    // thumb 在轨道内的可移动行程是 (1 - THUMB_RATIO);用百分比定位,无需知道轨道像素高度。
+    let thumb_top = ratio * (1.0 - THUMB_RATIO);
+
     div()
         .w(px(SCROLLBAR_WIDTH))
+        .h_full()
         .bg(rgb(terminal::SCROLLBAR_TRACK))
+        .relative()
         .child(
-            canvas(
-                // prepaint:thumb 位置由状态决定
-                move |_bounds, _window, _cx| (),
-                // paint:从共享状态读取 offset_ratio 绘制 thumb
-                move |bounds, (), window, _cx| {
-                    let ratio = state.lock().map(|s| s.offset_ratio).unwrap_or(0.0);
-                    paint_scrollbar(bounds, ratio, window);
-                },
-            )
-            .size_full(),
+            div()
+                .absolute()
+                .left(px(0.0))
+                .top(relative(thumb_top))
+                .w_full()
+                .h(relative(THUMB_RATIO))
+                .bg(rgb(terminal::SCROLLBAR_THUMB)),
         )
         .on_mouse_down(MouseButton::Left, mouse_down)
         .on_mouse_move(mouse_move)
         .into_any_element()
-}
-
-/// 绘制滚动条轨道与 thumb。thumb 高度 = 轨道高 ×(可见行/全部内容行),
-/// 位置 = ratio ×(轨道高 - thumb 高)。
-fn paint_scrollbar(bounds: Bounds<Pixels>, thumb_ratio_value: f32, window: &mut Window) {
-    let track_h: f32 = bounds.size.height.into();
-    let thumb_h = track_h * THUMB_RATIO;
-    // thumb_ratio_value:1.0 = 轨道底(最新内容),0.0 = 轨道顶(最旧内容)
-    let thumb_top = thumb_ratio_value * (track_h - thumb_h).max(0.0);
-    let thumb_bounds = Bounds::new(
-        Point::new(bounds.origin.x, bounds.origin.y + px(thumb_top)),
-        size(px(SCROLLBAR_WIDTH), px(thumb_h)),
-    );
-    window.paint_quad(fill(thumb_bounds, rgb(terminal::SCROLLBAR_THUMB)));
 }
 
 /// 绘制网格:先背景块,再文本,最后光标。所有数据来自快照,无锁。

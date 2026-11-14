@@ -19,8 +19,8 @@ use std::rc::Rc;
 
 use gpui::prelude::*;
 use gpui::{
-    canvas, div, point, px, rgb, App, Bounds, ClickEvent, Hsla, IntoElement, MouseButton,
-    MouseDownEvent, PathBuilder, Pixels, SharedString, Window, WindowControlArea,
+    div, px, rgb, App, ClickEvent, Hsla, IntoElement, MouseButton, MouseDownEvent, SharedString,
+    Window, WindowControlArea,
 };
 
 use crate::theme::{
@@ -232,6 +232,7 @@ fn control_button(
 
     div()
         .id(id)
+        .relative()
         .flex()
         .items_center()
         .justify_center()
@@ -249,70 +250,51 @@ fn control_button(
             let hovered = if is_hovered { Some(kind) } else { None };
             (hover)(&hovered, window, cx)
         })
-        .child(
-            canvas(
-                move |_bounds, _window, _cx| (),
-                move |bounds, (), window, _cx| {
-                    paint_control_icon(bounds, kind, active, bg, icon_color, window);
-                },
-            )
-            .size_full(),
-        )
+        // 图标用普通元素绘制而不是 canvas:窗口最小化后恢复时,canvas 自绘的内容
+        // 可能不会重新提交给合成器(实测表现为按钮与滚动条一起消失、点其他窗口才恢复)。
+        // div/border/text 这类常规元素走主渲染路径,不受该问题影响。
+        .child(div().absolute().size_full().bg(bg))
+        .child(control_icon(kind, active, icon_color))
         .into_any_element()
 }
 
-/// 在按钮区域内绘制图标。纯几何自绘,不依赖资源文件。
-fn paint_control_icon(
-    bounds: Bounds<Pixels>,
-    kind: WindowControl,
-    active: bool,
-    bg: Hsla,
-    icon_color: Hsla,
-    window: &mut Window,
-) {
-    window.paint_quad(gpui::fill(bounds, bg));
-
-    let center = bounds.center();
-    let stroke = px(1.0);
-
-    // 以按钮中心为原点绘制折线;坐标是固定常量,构建失败只跳过绘制,不 panic。
-    let mut draw = |points: &[(f32, f32)], close: bool| {
-        if points.is_empty() {
-            return;
-        }
-        let mut builder = PathBuilder::stroke(stroke);
-        builder.move_to(point(
-            center.x + px(points[0].0),
-            center.y + px(points[0].1),
-        ));
-        for (dx, dy) in &points[1..] {
-            builder.line_to(point(center.x + px(*dx), center.y + px(*dy)));
-        }
-        if close {
-            builder.close();
-        }
-        if let Ok(path) = builder.build() {
-            window.paint_path(path, icon_color);
-        }
-    };
-
+/// 控制按钮图标的几何形状。
+///
+/// 全部用 `div` 的宽高/边框/文字实现,不使用 `paint_path`:
+/// canvas 线条绘制在窗口最小化恢复后可能丢失,常规元素不会。
+fn control_icon(kind: WindowControl, active: bool, color: Hsla) -> gpui::AnyElement {
     match kind {
         // 最小化:一条水平线
-        WindowControl::Minimize => draw(&[(-4.0, 0.0), (4.0, 0.0)], false),
-        // 还原:两个错位的方框(后画的在前)
-        WindowControl::Maximize if active => {
-            draw(&[(-3.0, -4.0), (4.0, -4.0), (4.0, 3.0), (2.0, 3.0)], false);
-            draw(&[(-4.0, -2.0), (-4.0, 4.0), (3.0, 4.0), (3.0, 2.0)], false);
-        }
+        WindowControl::Minimize => div().w(px(10.0)).h(px(1.0)).bg(color).into_any_element(),
+        // 还原:两个错位的方框(外层右上、内层左下错位重叠)
+        WindowControl::Maximize if active => div()
+            .w(px(9.0))
+            .h(px(9.0))
+            .border_1()
+            .border_color(color)
+            .child(
+                div()
+                    .w(px(5.0))
+                    .h(px(5.0))
+                    .border_1()
+                    .border_color(color)
+                    .ml(px(-2.0))
+                    .mt(px(2.0)),
+            )
+            .into_any_element(),
         // 最大化:一个方框
-        WindowControl::Maximize => {
-            draw(&[(-4.0, -4.0), (4.0, -4.0), (4.0, 4.0), (-4.0, 4.0)], true)
-        }
-        // 关闭:两条对角线
-        WindowControl::Close => {
-            draw(&[(-4.0, -4.0), (4.0, 4.0)], false);
-            draw(&[(-4.0, 4.0), (4.0, -4.0)], false);
-        }
+        WindowControl::Maximize => div()
+            .w(px(9.0))
+            .h(px(9.0))
+            .border_1()
+            .border_color(color)
+            .into_any_element(),
+        // 关闭:用字形 "✕"(布局不支持 rotate,无法用两条线条拼出交叉)
+        WindowControl::Close => div()
+            .text_size(px(13.0))
+            .text_color(color)
+            .child("✕")
+            .into_any_element(),
     }
 }
 
