@@ -5,8 +5,9 @@ use std::sync::Arc;
 
 use gpui::prelude::*;
 use gpui::{
-    canvas, div, fill, font, px, rgb, size, App, Bounds, Context, Entity, FocusHandle, Focusable,
-    IntoElement, KeyDownEvent, Pixels, Point, Render, SharedString, Window,
+    canvas, div, fill, font, px, rgb, size, App, Bounds, Context, ElementInputHandler, Entity,
+    EntityInputHandler, FocusHandle, Focusable, IntoElement, KeyDownEvent, Pixels, Point, Render,
+    SharedString, UTF16Selection, Window,
 };
 
 use term_core::key::{encode_key, KeyState};
@@ -30,6 +31,9 @@ pub struct TerminalView {
     /// 实测的单字符 advance(px)。首次绘制时测量,替换粗略的 CELL_WIDTH 常量,
     /// 避免网格列宽与字体实际宽度不一致造成的空格过宽/错位。
     cell_width: f32,
+    /// IME 组合中(pinyin 等输入法的预编辑阶段)。组合中的按键不进 PTY,
+    /// 由 IME 提交结果后经 replace_text_in_range 写入。
+    ime_composing: bool,
     /// 待渲染快照(Wakeup 时刷新)。
     snapshot: Arc<GridSnapshot>,
 }
@@ -53,6 +57,7 @@ impl TerminalView {
             cols,
             rows,
             cell_width: CELL_WIDTH,
+            ime_composing: false,
             snapshot: Arc::new(GridSnapshot {
                 rows: rows as usize,
                 cols: cols as usize,
@@ -185,6 +190,11 @@ impl TerminalView {
 
     /// 处理键盘输入:编码并发送(KEY-004/KEY-005)。
     fn handle_key(&mut self, event: &KeyDownEvent, window: &mut Window, cx: &mut Context<Self>) {
+        // IME 组合中的按键已被输入法拦截(VK_PROCESSKEY),gpui 仍会发原始键的 KeyDown,
+        // 这里必须丢弃,否则拼音字母与提交后的汉字会双写进 PTY。
+        if self.ime_composing {
+            return;
+        }
         let keystroke = &event.keystroke;
         let m = &keystroke.modifiers;
 
@@ -231,6 +241,7 @@ impl Render for TerminalView {
         let snapshot = Arc::clone(&self.snapshot);
         let focus = self.focus.clone();
         let cell_width = self.cell_width;
+        let this = cx.entity();
 
         div()
             .id("terminal-root")
@@ -246,6 +257,12 @@ impl Render for TerminalView {
                     |_bounds, _window, _cx| {},
                     // paint:逐行绘制文本 run(相邻同样式单元格已合并)
                     move |bounds, (), window, cx| {
+                        // 注册 IME 输入处理器(paint 阶段必须;焦点在终端时平台才会投递组合文本)
+                        window.handle_input(
+                            &focus,
+                            ElementInputHandler::new(bounds, this),
+                            cx,
+                        );
                         paint_grid(&snapshot, cell_width, bounds, window, cx);
                     },
                 )
@@ -316,5 +333,98 @@ fn paint_grid(
             size(px(cell_width), px(CELL_HEIGHT)),
         );
         window.paint_quad(fill(cursor_bounds, gpui::hsla(0.0, 0.0, 0.9, 0.35)));
+    }
+}
+
+/// IME 集成:组合中的拼音不显示(候选窗由系统绘制,位置跟随终端光标),
+/// 提交的汉字串直接写 PTY。对齐 Windows Terminal 的行为。
+impl EntityInputHandler for TerminalView {
+    fn text_for_range(
+        &mut self,
+        _range_utf16: std::ops::Range<usize>,
+        _adjusted_range: &mut Option<std::ops::Range<usize>>,
+        _window: &mut Window,
+        _cx: &mut Context<Self>,
+    ) -> Option<String> {
+        // 终端无文档模型
+        None
+    }
+
+    fn selected_text_range(
+        &mut self,
+        _ignore_disabled_input: bool,
+        _window: &mut Window,
+        _cx: &mut Context<Self>,
+    ) -> Option<UTF16Selection> {
+        // 空选区:表示插入点存在,IME 候选窗经 bounds_for_range 跟随光标
+        Some(UTF16Selection {
+            range: 0..0,
+            reversed: false,
+        })
+    }
+
+    fn marked_text_range(
+        &self,
+        _window: &mut Window,
+        _cx: &mut Context<Self>,
+    ) -> Option<std::ops::Range<usize>> {
+        // 不显示预编辑文本
+        None
+    }
+
+    fn unmark_text(&mut self, _window: &mut Window, _cx: &mut Context<Self>) {
+        self.ime_composing = false;
+    }
+
+    fn replace_text_in_range(
+        &mut self,
+        _range: Option<std::ops::Range<usize>>,
+        text: &str,
+        _window: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
+        self.ime_composing = false;
+        // IME 提交的文本是用户意图输入的内容,不走粘贴过滤(PASTE 规则只约束粘贴通道)
+        self.session.write(text.as_bytes());
+        cx.notify();
+    }
+
+    fn replace_and_mark_text_in_range(
+        &mut self,
+        _range: Option<std::ops::Range<usize>>,
+        text: &str,
+        _new_selected_range: Option<std::ops::Range<usize>>,
+        _window: &mut Window,
+        _cx: &mut Context<Self>,
+    ) {
+        // 组合中:仅记录状态,不写入 PTY,也不在终端显示预编辑
+        self.ime_composing = !text.is_empty();
+    }
+
+    fn bounds_for_range(
+        &mut self,
+        _range_utf16: std::ops::Range<usize>,
+        element_bounds: Bounds<Pixels>,
+        _window: &mut Window,
+        _cx: &mut Context<Self>,
+    ) -> Option<Bounds<Pixels>> {
+        // 候选窗锚点:终端光标所在单元格(行 y 向下正,平台层会自行换算物理坐标)
+        let (row, col) = self.snapshot.cursor.unwrap_or((0, 0));
+        Some(Bounds::new(
+            Point::new(
+                element_bounds.origin.x + px(col as f32 * self.cell_width),
+                element_bounds.origin.y + px(row as f32 * CELL_HEIGHT),
+            ),
+            size(px(self.cell_width), px(CELL_HEIGHT)),
+        ))
+    }
+
+    fn character_index_for_point(
+        &mut self,
+        _point: Point<Pixels>,
+        _window: &mut Window,
+        _cx: &mut Context<Self>,
+    ) -> Option<usize> {
+        None
     }
 }
