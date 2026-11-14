@@ -38,6 +38,10 @@ pub fn encode_key(
                 None
             }
         }
+        // 空格:gpui 各平台把该键命名为 "space"(VK_SPACE => "space"),字符 0x20 由这里给出
+        ("space", false, _) => Some(vec![0x20]),
+        // Ctrl+Space → NUL(xterm 行为,IME 拦截与否由系统决定)
+        ("space", true, _) => Some(vec![0x00]),
         ("enter", ..) => Some(vec![b'\r']),
         ("backspace", ..) => Some(vec![0x7f]),
         ("tab", false, false) => Some(vec![b'\t']),
@@ -166,6 +170,15 @@ mod tests {
     fn alt_prefixes_esc() {
         let st = KeyState::default();
         assert_eq!(encode_key("x", false, true, false, st).unwrap(), b"\x1bx");
+    }
+
+    /// 空格键(gpui 命名 "space")→ 0x20
+    #[test]
+    fn space_key_sends_0x20() {
+        let st = KeyState::default();
+        assert_eq!(encode_key("space", false, false, false, st).unwrap(), vec![0x20]);
+        // Alt+Space 前缀 ESC
+        assert_eq!(encode_key("space", false, true, false, st).unwrap(), b"\x1b ");
     }
 
     /// 不产生输出的组合返回 None
