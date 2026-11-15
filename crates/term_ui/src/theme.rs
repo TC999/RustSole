@@ -38,6 +38,36 @@ pub mod terminal {
     pub const SELECTION_BG: u32 = 0x4a6d8c;
 }
 
+/// 标签栏配色。标签栏与窗口按钮共处标题栏一行(Konsole 默认布局),
+/// 因此底色与标题栏区分不明显,靠分隔线与文字亮度表达激活状态。
+pub mod tabbar {
+    /// 标签栏底色(未激活标签与空白处的底色)。
+    pub const BG: u32 = 0x1f1f1f;
+    /// 激活标签的底色(与终端内容一致,视觉上"连成一片")。
+    pub const ACTIVE_BG: u32 = 0x101010;
+    /// 未激活标签悬停时的底色。
+    pub const HOVER_BG: u32 = 0x2e2e2e;
+    /// 激活标签的文字颜色。
+    pub const ACTIVE_TEXT: u32 = 0xd0d0d0;
+    /// 未激活标签的文字颜色。
+    pub const INACTIVE_TEXT: u32 = 0x8a8a8a;
+    /// 标签之间的分隔线颜色。
+    pub const SEPARATOR: u32 = 0x333333;
+    /// 「新建标签」按钮的图标颜色。
+    pub const NEW_TAB_ICON: u32 = 0xb0b0b0;
+    /// 子进程已退出、但标签尚未关闭时的文字颜色(提示用户该标签已无进程)。
+    pub const EXITED_TEXT: u32 = 0x7a7a7a;
+}
+
+/// 「新建标签」按钮的宽度(px)。
+pub const NEW_TAB_BUTTON_WIDTH: f32 = 30.0;
+
+/// 单个标签的最小宽度(px)。标签多到放不下时保持这个宽度并横向滚动。
+pub const TAB_MIN_WIDTH: f32 = 90.0;
+
+/// 单个标签的最大宽度(px)。标签少时不会把标题拉成一整行。
+pub const TAB_MAX_WIDTH: f32 = 220.0;
+
 /// 标题栏高度(px)。与窗口控制按钮宽度一致时按钮是正方形热区。
 pub const TITLEBAR_HEIGHT: f32 = 32.0;
 

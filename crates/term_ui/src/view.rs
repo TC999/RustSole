@@ -1,5 +1,8 @@
-//! 终端视图:单窗口单终端(阶段 1)。
+//! 终端视图:一个标签的终端内容(阶段 1/3)。
 //! 输入采集与渲染在这里;快照提取在锁内、绘制在锁外(ARCHITECTURE.md 不变量 2/8)。
+//!
+//! 视图不再自绘标题栏:窗口装饰与标签条由 `tabs.rs` 的 `TabsView` 统一绘制,
+//! 这里只管终端内容区,并通过 `chrome_height` 得知上方被占用的高度。
 
 use std::cell::Cell;
 use std::rc::Rc;
@@ -7,10 +10,11 @@ use std::sync::Arc;
 
 use gpui::prelude::*;
 use gpui::{
-    canvas, div, fill, font, px, relative, rgb, size, App, Bounds, ClickEvent, Context,
-    DispatchPhase, ElementInputHandler, Entity, EntityInputHandler, FocusHandle, Focusable,
-    IntoElement, KeyDownEvent, MouseButton, MouseDownEvent, MouseMoveEvent, MouseUpEvent, Pixels,
-    Point, Render, ScrollDelta, ScrollWheelEvent, SharedString, UTF16Selection, Window,
+    canvas, div, fill, font, px, relative, rgb, size, App, Bounds, Context, DispatchPhase,
+    ElementInputHandler, Entity, EntityInputHandler, FocusHandle, Focusable, IntoElement,
+    KeyDownEvent, MouseButton, MouseDownEvent, MouseMoveEvent, MouseUpEvent, Pixels, Point,
+    PromptButton, PromptLevel, Render, ScrollDelta, ScrollWheelEvent, SharedString, UTF16Selection,
+    Window,
 };
 
 use alacritty_terminal::grid::{Dimensions as _, Scroll};
@@ -18,17 +22,30 @@ use alacritty_terminal::index::{Column, Line, Point as TermPoint, Side};
 use alacritty_terminal::selection::{Selection, SelectionType};
 use alacritty_terminal::term::TermMode;
 
+use term_config::Config;
 use term_core::key::{encode_key, KeyState};
-use term_core::paste::sanitize_paste;
+use term_core::paste::{needs_multiline_confirm, sanitize_paste};
 use term_core::proxy::TermEventMsg;
-use term_core::selection::SelectionBuffer;
+use term_core::selection::{trim_selection_text, word_span, SelectionBuffer};
 use term_core::session::Session;
 
 use crate::buffer;
 use crate::grid::{ratio_to_offset, snapshot, thumb_ratio, GridSnapshot};
 use crate::selection::{terminal_handles_mouse, DragAnchor, GridGeometry};
-use crate::theme::{terminal, window as window_theme, WindowControl, WindowControlsShown};
-use crate::titlebar::{render_titlebar, TitlebarHandlers, TitlebarModel};
+use crate::theme::{terminal, window as window_theme, WindowControl};
+
+/// 标签的默认标题:程序未通过 OSC 0/2 设置标题时显示。
+pub const DEFAULT_TAB_TITLE: &str = "RustSole";
+
+/// 终端视图对外的通知:目前只有标题变化。
+///
+/// 标题由 OSC 0/2 在 PTY 事件任务里更新,标签条由 `TabsView` 绘制,
+/// 两者不在同一实体:必须通过事件让容器重绘,否则标题条上的文字永远停在初始值。
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum TerminalEvent {
+    /// 程序设置了新标题。
+    TitleChanged,
+}
 
 /// 单元格像素尺寸(阶段 1 固定值,随 HiDPI 缩放由 GPUI 处理)。
 pub const CELL_WIDTH: f32 = 8.0;
@@ -49,10 +66,24 @@ struct ScrollDrag {
     grab_offset: f32,
 }
 
+/// 等待用户确认的多行粘贴(PASTE-003)。
+///
+/// 确认对话框是异步的:window.prompt 返回的 oneshot::Receiver 只能在未来任务里 await。
+/// 在等待期间把待粘贴文本与 bracketed 状态存起来,用户确认后再发送;取消则丢弃。
+#[derive(Debug, Clone)]
+struct PendingPaste {
+    /// 选区缓冲取出的原文(未经 PASTE 清洗)。
+    text: String,
+    /// 发送时程序是否处于 bracketed paste 模式。
+    bracketed: bool,
+}
+
 /// 终端视图状态。
 pub struct TerminalView {
     session: Session,
     focus: FocusHandle,
+    /// 只读配置快照(ARCHITECTURE.md 不变量 9):copy_on_select、粘贴确认开关。
+    config: Arc<Config>,
     /// 当前生效的字符网格尺寸。
     cols: u16,
     rows: u16,
@@ -72,16 +103,24 @@ pub struct TerminalView {
     scrollbar_ratio: f32,
     /// 待渲染快照(Wakeup 时刷新)。
     snapshot: Arc<GridSnapshot>,
-    /// 窗口标题(标题栏文字;程序通过 OSC 0/2 设置标题时更新)。
+    /// 标签标题(程序通过 OSC 0/2 设置标题时更新,由标签条显示)。
     title: SharedString,
-    /// 标题栏上当前悬停的控制按钮(None = 不在任何一个按钮上)。
-    hovered_control: Option<WindowControl>,
+    /// 上方不属于终端内容的像素高度(标签栏)。由 TabsView 在布局时告知,
+    /// 网格行数按「客户区高度 - chrome_height」计算(WIN-007)。
+    chrome_height: f32,
     /// 窗口激活状态观察者(首次 render 时注册,见 render 中的说明)。
     activation_subscription: Option<gpui::Subscription>,
     /// 选区缓冲。首次 render 时从全局取共享实例(SEL-007),之后复用。
     selection_buffer: Option<Arc<SelectionBuffer>>,
     /// 左键拖选的锚点;None 表示当前没有拖选进行中。
     drag_anchor: Option<DragAnchor>,
+    /// 键盘扩展选区(SEL-005)的固定锚点;None 表示没有键盘选区。
+    /// 锚点在首次按下 Shift+方向键时确定为当前光标,之后只移动焦点。
+    keyboard_anchor: Option<TermPoint>,
+    /// 键盘扩展选区的当前焦点端点;与 keyboard_anchor 配对。
+    keyboard_focus: Option<TermPoint>,
+    /// 等待确认的多行粘贴(PASTE-003);None 表示没有待确认粘贴。
+    paste_pending: Option<PendingPaste>,
     /// 终端画布在视口中的左上角(逻辑像素),每次绘制时由 canvas 回填。
     /// 鼠标事件给的是视口坐标,换算单元格必须减去这个偏移。
     /// 用 `Cell` 而不是字段直接赋值:paint 闭包只拿到共享引用,不能改视图字段。
@@ -93,10 +132,16 @@ impl TerminalView {
     ///
     /// cols/rows 必须与创建时的视口一致:Term 与 PTY 从一开始就同尺寸,
     /// 避免启动窗口期 EventLoop 向小网格写入大量输出导致越界。
+    /// chrome_height 是标签栏占用的高度,只影响网格行数计算,不参与 PTY 初始尺寸。
     ///
     /// # Errors
     /// PTY/shell 启动失败时返回,由入口显示给用户(CODING_STANDARDS.md 第 3 节)。
-    pub fn new(cx: &mut App, cols: u16, rows: u16) -> gpui::Result<Entity<Self>> {
+    pub fn new(
+        cx: &mut App,
+        cols: u16,
+        rows: u16,
+        chrome_height: f32,
+    ) -> gpui::Result<Entity<Self>> {
         let session = Session::new(cols, rows)
             .map_err(|e| gpui::private::anyhow::anyhow!("启动终端会话失败: {e}"))?;
 
@@ -107,6 +152,7 @@ impl TerminalView {
         let view = cx.new(|cx| Self {
             session,
             focus,
+            config: Arc::new(Config::default()),
             cols,
             rows,
             cell_width: CELL_WIDTH,
@@ -123,11 +169,14 @@ impl TerminalView {
                 display_offset: 0,
                 selection: Vec::new(),
             }),
-            title: SharedString::from("RustSole"),
-            hovered_control: None,
+            title: SharedString::from(DEFAULT_TAB_TITLE),
+            chrome_height,
             activation_subscription: None,
             selection_buffer: buffer::shared(cx),
             drag_anchor: None,
+            keyboard_anchor: None,
+            keyboard_focus: None,
+            paste_pending: None,
             canvas_origin: Rc::new(Cell::new((0.0, 0.0))),
         });
 
@@ -174,6 +223,8 @@ impl TerminalView {
                             if view.title != title {
                                 view.title = title;
                                 had_wakeup = true;
+                                // 标签条由 TabsView 绘制,必须通知它重绘(WIN-008)
+                                cx.emit(TerminalEvent::TitleChanged);
                             }
                         }
                         if had_wakeup {
@@ -335,7 +386,11 @@ impl TerminalView {
             // 列宽变了,重新按新宽度计算网格尺寸并同步 PTY。
             // 算法必须与 sync_size 保持一致(同样扣掉滚动条轨道宽度),否则首次测量后
             // 会先按整幅宽度算出偏多的列数,下一帧再被 sync_size 改回来,窗口一开就抖动。
-            let width: f32 = window.viewport_size().width.into();
+            let viewport = window.viewport_size();
+            let width: f32 = viewport.width.into();
+            // 行数按扣掉 chrome 之后的可用高度算,与 sync_size 保持一致
+            let height = (f32::from(viewport.height) - self.chrome_height).max(0.0);
+            self.rows = ((height / CELL_HEIGHT).floor() as u16).max(1);
             self.cols = (((width - SCROLLBAR_WIDTH) / w).floor() as u16).max(2);
             self.session.resize(self.cols, self.rows);
             {
@@ -391,27 +446,6 @@ impl TerminalView {
         self.scrollbar_ratio = thumb_ratio(offset, history);
     }
 
-    /// 本帧实际可用的客户区尺寸(逻辑像素)。
-    ///
-    /// 优先用 Win32 读到的真实客户区:窗口"最大化 -> 最小化 -> 还原为普通尺寸"后,
-    /// gpui 的 `viewport_size()` 可能仍停留在最大化时的大小,而按它布局的自绘元素
-    /// (标题栏按钮、滚动条)会被画到窗口外。两者相差超过 1px 时以系统值为准
-    /// (1px 以内视为取整误差,避免每帧来回切换导致布局抖动)。
-    fn layout_size(window: &Window) -> (f32, f32) {
-        let vp = window.viewport_size();
-        let viewport = (f32::from(vp.width), f32::from(vp.height));
-        match term_platform::client_size_logical(window.scale_factor()) {
-            Some((w, h)) if w > 1.0 && h > 1.0 => {
-                let differs = (w - viewport.0).abs() > 1.0 || (h - viewport.1).abs() > 1.0;
-                if differs {
-                    (w, h)
-                } else {
-                    viewport
-                }
-            }
-            _ => viewport,
-        }
-    }
 
     /// 不变量 2:锁内只取快照,立即释放。
     fn refresh_snapshot(&mut self) {
@@ -427,9 +461,9 @@ impl TerminalView {
     /// 不一定等于 `window.viewport_size()`。
     fn sync_size(&mut self, size: (f32, f32), cx: &mut Context<Self>) {
         let (width, height) = size;
-        // 视口高度里扣掉自绘标题栏:终端网格只占标题栏以下的区域(WIN-001)。
-        // 若不扣,最后一行会被标题栏遮住,且 `stty size` 比可见行数多 2 行左右。
-        let height: f32 = (height - crate::theme::TITLEBAR_HEIGHT).max(0.0);
+        // 客户区高度里扣掉标签栏等 chrome:终端网格只占其下方区域(WIN-007)。
+        // 若不扣,最后一行会被 chrome 遮住,且 stty size 比可见行数多。
+        let height: f32 = (height - self.chrome_height).max(0.0);
         // 扣掉滚动条轨道宽度(列数按终端画布实际可用宽度算)
         // alacritty 限制:MIN_COLUMNS=2,可见行至少 1
         let new_cols = (((width - SCROLLBAR_WIDTH) / self.cell_width).floor() as u16).max(2);
@@ -467,6 +501,22 @@ impl TerminalView {
         }
         let keystroke = &event.keystroke;
         let m = &keystroke.modifiers;
+
+        // SEL-005:Shift+方向键/Home/End 扩展选区,不发送给终端,也不进入编码器。
+        // Ctrl+Shift 组合保留给应用快捷键,不作为选区扩展键。
+        let is_select_key = m.shift
+            && !m.control
+            && matches!(
+                keystroke.key.as_str(),
+                "up" | "down" | "left" | "right" | "home" | "end"
+            );
+        if is_select_key {
+            self.extend_selection_by_key(&keystroke.key, cx);
+            return;
+        }
+        // 其他按键结束键盘扩展选区,避免锚点状态残留到下一次无关操作
+        self.keyboard_anchor = None;
+        self.keyboard_focus = None;
 
         // Ctrl+Shift 组合保留给应用快捷键(Ctrl+Shift+C/V 等),不进编码器
         if m.control && m.shift {
@@ -546,7 +596,7 @@ impl TerminalView {
         })
     }
 
-    /// 鼠标按下:左键开始拖选(SEL-001),中键粘贴选区缓冲(SEL-002)。
+    /// 鼠标按下:左键开始拖选/选词/选行/块选(SEL-001/009/010),中键粘贴选区缓冲(SEL-002)。
     fn handle_mouse_down(
         &mut self,
         event: &MouseDownEvent,
@@ -555,6 +605,9 @@ impl TerminalView {
     ) {
         // 点击终端要收回键盘焦点,否则选区后键盘输入落到别处
         self.focus.focus(window);
+        // 鼠标操作会打断键盘扩展选区(SEL-005),避免两套选区状态互相干扰
+        self.keyboard_anchor = None;
+        self.keyboard_focus = None;
 
         // MOUSE-001/002:程序接管鼠标时终端不抢事件;Shift 强制由终端处理
         let mouse_reporting = {
@@ -571,24 +624,65 @@ impl TerminalView {
                     return;
                 };
                 self.drag_anchor = Some(anchor);
-                {
-                    let mut term = self.session.term.lock();
-                    // 开始新的选择:旧高亮立即消失(缓冲内容保持不变)
-                    term.selection = Some(Selection::new(
-                        SelectionType::Simple,
-                        TermPoint::new(Line(anchor.line), Column(anchor.col)),
-                        side_of(anchor.side_left),
-                    ));
-                }
-                self.refresh_snapshot();
-                cx.notify();
+                self.begin_selection(anchor, event, cx);
             }
-            MouseButton::Middle => self.paste_selection_buffer(cx),
+            MouseButton::Middle => self.paste_selection_buffer(window, cx),
             _ => {}
         }
     }
 
-    /// 鼠标移动:拖动中把选区末端移到当前单元格。
+    /// 按点击次数与修饰键确定选区类型并建立选区。
+    ///
+    /// SEL-009:单击普通选择;双击选词;三击选行。
+    /// SEL-010:Ctrl+Alt 拖拽为块(矩形)选择。
+    /// SEL-011:双击选词的词内字符集见 term_core::selection::WORD_EXTRA_CHARS。
+    fn begin_selection(
+        &mut self,
+        anchor: DragAnchor,
+        event: &MouseDownEvent,
+        cx: &mut Context<Self>,
+    ) {
+        let point = TermPoint::new(Line(anchor.line), Column(anchor.col));
+        let selection_type = if event.modifiers.control && event.modifiers.alt {
+            // SEL-010:Ctrl+Alt 块选
+            SelectionType::Block
+        } else if event.click_count >= 3 {
+            // SEL-009:三击选行(整行)
+            SelectionType::Lines
+        } else {
+            SelectionType::Simple
+        };
+        let mut selection = Selection::new(selection_type, point, side_of(anchor.side_left));
+
+        // 双击选词:把选区扩展为锚点所在词(SEL-009/SEL-011)
+        if event.click_count == 2 && selection_type == SelectionType::Simple {
+            if let Some((start, end)) = self.word_span_at(anchor) {
+                selection = Selection::new(
+                    SelectionType::Simple,
+                    TermPoint::new(Line(anchor.line), Column(start)),
+                    Side::Left,
+                );
+                selection.update(TermPoint::new(Line(anchor.line), Column(end)), Side::Right);
+            }
+        }
+
+        {
+            let mut term = self.session.term.lock();
+            // 开始新的选择:旧高亮立即消失(缓冲内容保持不变)
+            term.selection = Some(selection);
+        }
+        self.refresh_snapshot();
+        cx.notify();
+    }
+
+    /// 取锚点所在行的词区间(SEL-009/SEL-011);行号越界或非词字符时返回 None。
+    /// 锁内只做纯计算,无 I/O(不变量 2)。
+    fn word_span_at(&self, anchor: DragAnchor) -> Option<(usize, usize)> {
+        let term = self.session.term.lock();
+        word_span(&term.grid()[Line(anchor.line)], anchor.col)
+    }
+
+    /// 鼠标移动:拖动中把选区末端移到当前单元格;到边缘时自动滚动并持续扩展(SEL-013)。
     fn handle_mouse_move(&mut self, event: &MouseMoveEvent, cx: &mut Context<Self>) {
         if self.drag_anchor.is_none() {
             return;
@@ -598,44 +692,190 @@ impl TerminalView {
             self.drag_anchor = None;
             return;
         }
-        let Some(end) = self.cell_from_position(event.position) else {
-            return;
-        };
-        {
-            let mut term = self.session.term.lock();
-            if let Some(selection) = term.selection.as_mut() {
-                selection.update(
-                    TermPoint::new(Line(end.line), Column(end.col)),
-                    side_of(end.side_left),
-                );
+        // 端点行号是 grid 行(含历史偏移);自动滚动需要的是视口行,这里一并算出
+        let (end, end_row) = match self.cell_from_position(event.position) {
+            Some(end) => {
+                let offset = { self.session.term.lock().grid().display_offset() as i32 };
+                (end, (end.line + offset) as usize)
             }
+            None => return,
+        };
+        // SEL-013:拖到视口上下边缘时滚动一行;滚动后同一视口位置对应的 grid 行已变化,
+        // 需要重新换算端点,选区才能持续向历史/新内容延伸
+        if self.autoscroll_for_drag(end_row, cx) {
+            if let Some(end) = self.cell_from_position(event.position) {
+                self.update_selection_end(end);
+            }
+        } else {
+            self.update_selection_end(end);
         }
         self.refresh_snapshot();
         cx.notify();
     }
 
-    /// 鼠标抬起:左键抬起时把选中文本写入选区缓冲(SEL-001)。
-    ///
-    /// 空选区不覆盖已有内容(SEL-004)。
-    fn handle_mouse_up(&mut self, event: &MouseUpEvent, cx: &mut Context<Self>) {
-        if event.button != MouseButton::Left || self.drag_anchor.take().is_none() {
-            return;
+    /// 把选区末端移动到给定单元格(锁内完成)。
+    fn update_selection_end(&mut self, end: DragAnchor) {
+        let mut term = self.session.term.lock();
+        if let Some(selection) = term.selection.as_mut() {
+            selection.update(
+                TermPoint::new(Line(end.line), Column(end.col)),
+                side_of(end.side_left),
+            );
         }
+    }
+
+    /// SEL-013:拖到视口上下边缘时滚动一行。返回是否发生了滚动。
+    ///
+    /// 向下边缘滚动 → 显示更新内容(display_offset 减小);向上边缘 → 回看历史(增大)。
+    fn autoscroll_for_drag(&mut self, end_row: usize, cx: &mut Context<Self>) -> bool {
+        let at_top = end_row == 0;
+        let at_bottom = end_row + 1 >= self.rows as usize;
+        if !at_top && !at_bottom {
+            return false;
+        }
+        let (history, offset) = {
+            let term = self.session.term.lock();
+            (term.grid().history_size(), term.grid().display_offset())
+        };
+        if history == 0 {
+            return false;
+        }
+        let target = (offset as i32 + if at_bottom { -1 } else { 1 }).clamp(0, history as i32);
+        if target == offset as i32 {
+            return false;
+        }
+        self.set_display_offset(target, cx);
+        true
+    }
+
+    /// 把当前选区提交到选区缓冲(SEL-001/SEL-004/SEL-012),并按配置镜像到系统通道。
+    ///
+    /// SEL-004:空选区不覆盖已有内容。SEL-012:写缓冲前裁剪每行行尾空白。
+    /// SEL-008:配置开启时额外写系统剪贴板;SEL-006:Linux 等平台同时写 PRIMARY。
+    fn commit_selection(&mut self, cx: &mut Context<Self>) {
         let text = {
             let term = self.session.term.lock();
             term.selection_to_string()
         };
-        // 锁已释放:写缓冲不属于终端状态
-        if let Some(text) = text {
-            if !text.is_empty() {
-                self.selection_buffer().set(text);
-            }
+        let Some(text) = text else {
+            return;
+        };
+        let cleaned = trim_selection_text(&text);
+        if cleaned.is_empty() {
+            // 空选区不覆盖已有缓冲(SEL-004)
+            return;
         }
+        self.selection_buffer().set(cleaned.clone());
+        // 锁已释放:写系统通道不属于终端状态
+        crate::clipboard::write_selection(cx, &cleaned, self.config.selection.copy_on_select);
         cx.notify();
     }
 
+    /// 键盘扩展选区(SEL-005):Shift+方向键/Home/End 移动焦点并更新选区。
+    ///
+    /// 首次按下时以当前光标为锚点,之后只移动焦点端点;每次扩展后写入选区缓冲。
+    /// 不发送任何按键序列给终端(与 KEY-005 的方向键编码互不影响)。
+    fn extend_selection_by_key(&mut self, key: &str, cx: &mut Context<Self>) {
+        {
+            let mut term = self.session.term.lock();
+            let cursor = term.grid().cursor.point;
+            let grid = term.grid();
+            let (anchor, focus) = match (self.keyboard_anchor, self.keyboard_focus) {
+                (Some(a), Some(f)) => (a, f),
+                // 首次:锚点与焦点都取当前光标
+                _ => (cursor, cursor),
+            };
+            self.keyboard_anchor = Some(anchor);
+            let moved = match key {
+                "up" => TermPoint::new(Line(focus.line.0 - 1), focus.column),
+                "down" => TermPoint::new(Line(focus.line.0 + 1), focus.column),
+                "left" => TermPoint::new(focus.line, Column(focus.column.0.saturating_sub(1))),
+                "right" => TermPoint::new(focus.line, Column(focus.column.0 + 1)),
+                "home" => TermPoint::new(focus.line, Column(0)),
+                "end" => TermPoint::new(focus.line, grid.last_column()),
+                _ => return,
+            };
+            // 钳制到可见网格范围
+            let top = Line(-(grid.display_offset() as i32));
+            let bottom = Line(top.0 + grid.bottommost_line().0);
+            let point = TermPoint::new(
+                Line(moved.line.0.max(top.0).min(bottom.0)),
+                Column(moved.column.0.min(grid.last_column().0)),
+            );
+            let side = match key {
+                "up" | "left" | "home" => Side::Left,
+                _ => Side::Right,
+            };
+            let selection = term.selection.get_or_insert_with(|| {
+                Selection::new(
+                    SelectionType::Simple,
+                    TermPoint::new(anchor.line, Column(anchor.column.0)),
+                    Side::Left,
+                )
+            });
+            selection.update(point, side);
+            self.keyboard_focus = Some(point);
+        }
+        self.refresh_snapshot();
+        self.commit_selection(cx);
+    }
+
+    /// 鼠标抬起:左键抬起时把选中文本写入选区缓冲(SEL-001)。
+    fn handle_mouse_up(&mut self, event: &MouseUpEvent, cx: &mut Context<Self>) {
+        if event.button != MouseButton::Left || self.drag_anchor.take().is_none() {
+            return;
+        }
+        self.commit_selection(cx);
+    }
+
+    /// 当前网格列数(新建标签按同样尺寸启动)。
+    pub fn cols(&self) -> u16 {
+        self.cols
+    }
+
+    /// 当前网格行数。
+    pub fn rows(&self) -> u16 {
+        self.rows
+    }
+
+    /// 标签标题(标签条显示用)。
+    pub fn title(&self) -> SharedString {
+        self.title.clone()
+    }
+
+    /// 子进程是否已退出。
+    pub fn exited(&self) -> bool {
+        self.session.exited()
+    }
+
+    /// 更新上方 chrome(标签栏)占用的高度,只在变化时重算网格。
+    ///
+    /// `TabsView` 在布局阶段调用:窗口尺寸变化后终端网格必须跟着改,
+    /// 否则最后一行会被标签栏遮住(WIN-007)。
+    pub fn set_chrome_height(&mut self, height: f32, cx: &mut Context<Self>) {
+        if (self.chrome_height - height).abs() < 0.5 {
+            return;
+        }
+        self.chrome_height = height;
+        cx.notify();
+    }
+
+    /// 这个标签被切换为激活时调用:刷新快照,避免显示切换前的旧画面。
+    pub fn refresh_on_activate(&mut self, cx: &mut Context<Self>) {
+        self.refresh_snapshot();
+        self.refresh_scrollbar_state();
+        cx.notify();
+    }
+
+    /// 键盘焦点移入这个标签的终端。
+    pub fn focus_terminal(&self, window: &mut Window) {
+        self.focus.focus(window);
+    }
+
     /// 中键粘贴选区缓冲(SEL-002):与剪贴板粘贴共用同一个清洗函数(PASTE-*)。
-    fn paste_selection_buffer(&mut self, cx: &mut Context<Self>) {
+    ///
+    /// PASTE-003:未开启 bracketed paste 且文本含换行时,弹出确认对话框(可在配置中关闭)。
+    fn paste_selection_buffer(&mut self, window: &mut Window, cx: &mut Context<Self>) {
         let Some(text) = self.selection_buffer().get() else {
             // 缓冲为空:不发送任何字节(发送空输入会让终端挂起)
             return;
@@ -644,6 +884,49 @@ impl TerminalView {
             let term = self.session.term.lock();
             term.mode().contains(TermMode::BRACKETED_PASTE)
         };
+        let needs_confirm =
+            needs_multiline_confirm(bracketed, &text, self.config.paste.confirm_multiline);
+        if needs_confirm {
+            self.ask_paste_confirm(window, text, bracketed, cx);
+            return;
+        }
+        self.send_paste(text, bracketed, cx);
+    }
+
+    /// 弹出多行粘贴确认(PASTE-003)。确认后在异步任务里发送,取消则丢弃。
+    fn ask_paste_confirm(
+        &mut self,
+        window: &mut Window,
+        text: String,
+        bracketed: bool,
+        cx: &mut Context<Self>,
+    ) {
+        let answers = [PromptButton::ok("粘贴"), PromptButton::cancel("取消")];
+        let receiver = window.prompt(
+            PromptLevel::Warning,
+            "粘贴多行文本?",
+            Some("将把换行符发送给程序,可能立即执行多行命令"),
+            &answers,
+            cx,
+        );
+        self.paste_pending = Some(PendingPaste { text, bracketed });
+        cx.spawn(async move |weak, cx| {
+            // 第一个按钮(确定)的索引为 0
+            let confirmed = matches!(receiver.await, Ok(0));
+            weak.update(cx, |view, cx| {
+                if let Some(pending) = view.paste_pending.take() {
+                    if confirmed {
+                        view.send_paste(pending.text, pending.bracketed, cx);
+                    }
+                }
+            })
+            .ok();
+        })
+        .detach();
+    }
+
+    /// 执行粘贴:清洗后写入 PTY(PASTE-001/002/004/005)。
+    fn send_paste(&mut self, text: String, bracketed: bool, cx: &mut Context<Self>) {
         let payload = sanitize_paste(&text, bracketed);
         self.session.write(payload.as_bytes());
         cx.notify();
@@ -740,6 +1023,30 @@ fn paint_selection(
     }
 }
 
+/// 本帧实际可用的客户区尺寸(逻辑像素)。
+///
+/// 优先用平台层读到的真实客户区:窗口「最大化 -> 最小化 -> 还原为普通尺寸」后,
+/// gpui 的 `viewport_size()` 可能仍停留在最大化时的大小,而按它布局的自绘元素
+/// (标签条、窗口按钮、滚动条)会被画到窗口外——表现为按钮整组消失,点击别的窗口
+/// 才恢复。两者相差超过 1px 时以系统值为准(1px 以内视为取整误差,避免布局抖动)。
+///
+/// 根视图(`TabsView`)与终端内容区都用它,保证两层布局用同一个尺寸。
+pub(crate) fn layout_size(window: &Window) -> (f32, f32) {
+    let vp = window.viewport_size();
+    let viewport = (f32::from(vp.width), f32::from(vp.height));
+    match term_platform::client_size_logical(window.scale_factor()) {
+        Some((w, h)) if w > 1.0 && h > 1.0 => {
+            let differs = (w - viewport.0).abs() > 1.0 || (h - viewport.1).abs() > 1.0;
+            if differs {
+                (w, h)
+            } else {
+                viewport
+            }
+        }
+        _ => viewport,
+    }
+}
+
 /// 单元格半侧 → alacritty 的选择端点方向。
 fn side_of(side_left: bool) -> Side {
     if side_left {
@@ -748,6 +1055,8 @@ fn side_of(side_left: bool) -> Side {
         Side::Right
     }
 }
+
+impl gpui::EventEmitter<TerminalEvent> for TerminalView {}
 
 impl Focusable for TerminalView {
     fn focus_handle(&self, _cx: &App) -> FocusHandle {
@@ -759,7 +1068,7 @@ impl Render for TerminalView {
     fn render(&mut self, window: &mut Window, cx: &mut Context<Self>) -> impl IntoElement {
         // 先用校正后的客户区尺寸(而不是可能滞后的 viewport_size)同步终端网格,
         // 再用同一个尺寸给根节点显式宽高,保证自绘元素不会被画到窗口外。
-        let layout = Self::layout_size(window);
+        let layout = layout_size(window);
         // PTY 事件由 spawn_event_loop 的常驻任务驱动重绘;render 只处理视口尺寸变化
         self.sync_size(layout, cx);
         self.measure_cell_width(window);
@@ -788,50 +1097,13 @@ impl Render for TerminalView {
         // 闭包只能拿共享引用,因此画布原点通过 Rc<Cell<_>> 共享给 paint 与鼠标回调。
         let canvas_origin = Rc::clone(&self.canvas_origin);
 
-        let titlebar = render_titlebar(
-            &TitlebarModel {
-                title: self.title.clone(),
-                maximized: window.is_maximized(),
-                focused: window.is_window_active(),
-                controls: WindowControlsShown {
-                    minimize: true,
-                    maximize: true,
-                },
-                hovered: self.hovered_control,
-            },
-            TitlebarHandlers {
-                drag: Rc::new(cx.listener(
-                    |_view, _event: &MouseDownEvent, window: &mut Window, _cx| {
-                        start_window_drag(window);
-                    },
-                )),
-                double_click: Rc::new(cx.listener(
-                    |_view, _event: &ClickEvent, window: &mut Window, _cx| {
-                        toggle_maximize(window);
-                    },
-                )),
-                control: Rc::new(cx.listener(
-                    |_view, kind: &WindowControl, window: &mut Window, _cx| {
-                        apply_window_control(*kind, window);
-                    },
-                )),
-                hover: Rc::new(cx.listener(
-                    |view, hovered: &Option<WindowControl>, _window, cx| {
-                        if view.hovered_control != *hovered {
-                            view.hovered_control = *hovered;
-                            cx.notify();
-                        }
-                    },
-                )),
-            },
-        );
-
         div()
             .id("terminal-root")
             // 显式宽高而不是 size_full:窗口状态变化后 gpui 的 viewport 可能滞后,
-            // 用实测客户区尺寸可以让标题栏按钮与滚动条始终落在窗口内。
+            // 用实测客户区尺寸可以让滚动条始终落在窗口内。
+            // 高度扣掉 chrome:标签栏由 TabsView 绘制在终端内容之上。
             .w(px(layout.0))
-            .h(px(layout.1))
+            .h(px((layout.1 - self.chrome_height).max(0.0)))
             .flex()
             .flex_col()
             .bg(rgb(window_theme::WINDOW_BG))
@@ -839,7 +1111,6 @@ impl Render for TerminalView {
             .on_key_down(cx.listener(|view, event: &KeyDownEvent, window, cx| {
                 view.handle_key(event, window, cx);
             }))
-            .child(titlebar)
             .child(
                 // 终端内容区:滚轮回看历史
                 div()
@@ -898,7 +1169,7 @@ impl Render for TerminalView {
 ///   在该平台又是空实现,因此交给 [`term_platform::begin_window_drag`] 直连 Win32
 ///   (`ReleaseCapture` + `WM_NCLBUTTONDOWN`/`HTCAPTION`),由系统接管拖动。
 /// - Linux(X11/Wayland):gpui 已实现 `start_window_move`,直接调用。
-fn start_window_drag(window: &mut Window) {
+pub(crate) fn start_window_drag(window: &mut Window) {
     match term_platform::window_chrome() {
         term_platform::WindowChrome::SystemHandled => {
             term_platform::begin_window_drag();
@@ -912,7 +1183,7 @@ fn start_window_drag(window: &mut Window) {
 /// - Windows:`zoom_window` 只会 `SW_MAXIMIZE`,还原必须走
 ///   [`term_platform::restore_window`] 的 `ShowWindow(SW_RESTORE)`。
 /// - X11/Wayland:`zoom()` 本身就是切换语义,直接调用即可。
-fn toggle_maximize(window: &mut Window) {
+pub(crate) fn toggle_maximize(window: &mut Window) {
     match term_platform::window_chrome() {
         term_platform::WindowChrome::SystemHandled => {
             if window.is_maximized() {
@@ -929,7 +1200,7 @@ fn toggle_maximize(window: &mut Window) {
 ///
 /// 注意:即便按钮上设置了 `WindowControlArea`,Windows 的 NC 命中测试路径实测未生效,
 /// 因此这里统一由应用侧调用 `Window` 方法,保证按钮在两平台都可用。
-fn apply_window_control(kind: WindowControl, window: &mut Window) {
+pub(crate) fn apply_window_control(kind: WindowControl, window: &mut Window) {
     match kind {
         WindowControl::Minimize => window.minimize_window(),
         WindowControl::Maximize => toggle_maximize(window),

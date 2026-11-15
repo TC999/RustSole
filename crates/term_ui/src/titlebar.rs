@@ -100,11 +100,19 @@ pub fn control_layout(model: &TitlebarModel) -> [ControlSpec; 3] {
 
 /// 渲染标题栏。
 ///
-/// 布局方式:拖动区 `flex_1` 吃掉剩余宽度,按钮区固定宽度靠右。
+/// 布局方式:中间区 `flex_1` 吃掉剩余宽度,按钮区固定宽度靠右。
 /// 为什么不用 `viewport_size` 手工算宽度:窗口最大化/最小化/还原时,GPUI 报告的
 /// 视口尺寸可能与窗口实际客户区短暂不一致,按它算出的固定宽度会把按钮推到窗口外
 /// (表现为"最大化后最小化再还原,三个按钮消失")。交给 flex 布局则始终贴着实际右边缘。
-pub fn render_titlebar(model: &TitlebarModel, handlers: TitlebarHandlers) -> impl IntoElement {
+///
+/// `center` 是标签条(多标签时)或 `None`(单标签或标签条未启用时显示标题文字的拖动区)。
+/// 有标签条时它占满中间区:此时双击由标签条自己处理(空白处新建标签,MOUSE-005),
+/// 标题栏不再叠加"双击最大化",避免同一次双击触发两个动作。
+pub fn render_titlebar(
+    model: &TitlebarModel,
+    center: Option<gpui::AnyElement>,
+    handlers: TitlebarHandlers,
+) -> impl IntoElement {
     let specs = control_layout(model);
     let hovered = model.hovered;
     let text_color: Hsla = if model.focused {
@@ -169,8 +177,10 @@ pub fn render_titlebar(model: &TitlebarModel, handlers: TitlebarHandlers) -> imp
     };
 
     let double_click = Rc::clone(&handlers.double_click);
+    // 有标签条时中间区由标签条占据,窗口拖动由标签条空白区自己发起
+    let has_tabs = center.is_some();
 
-    div()
+    let mut bar = div()
         .id("titlebar")
         .flex()
         .flex_row()
@@ -180,14 +190,20 @@ pub fn render_titlebar(model: &TitlebarModel, handlers: TitlebarHandlers) -> imp
         .w_full()
         .bg(rgb(window::TITLEBAR_BG))
         .border_b_1()
-        .border_color(rgb(window::TITLEBAR_BORDER))
-        .on_click(move |event, window, cx| {
+        .border_color(rgb(window::TITLEBAR_BORDER));
+    if !has_tabs {
+        // 无标签条时才由标题栏本身承担双击最大化(WIN-002)
+        bar = bar.on_click(move |event, window, cx| {
             if event.click_count() == 2 {
                 (double_click)(event, window, cx);
             }
-        })
-        .child(drag_area)
-        .child(buttons)
+        });
+    }
+
+    match center {
+        Some(center) => bar.child(center).child(buttons),
+        None => bar.child(drag_area).child(buttons),
+    }
 }
 
 /// 单个控制按钮:命中区是 div,图标用 canvas 自绘。
