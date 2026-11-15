@@ -27,6 +27,14 @@ pub fn sanitize_paste(text: &str, bracketed_paste: bool) -> String {
     }
 }
 
+/// 判断一次粘贴是否需要多行确认对话框(PASTE-003)。
+///
+/// 仅当程序未开启 bracketed paste、文本含换行且确认开关开启时需要确认。
+/// 抽成纯函数以便脱离图形环境测试。
+pub fn needs_multiline_confirm(bracketed: bool, text: &str, confirm_enabled: bool) -> bool {
+    !bracketed && confirm_enabled && text.contains('\n')
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -61,5 +69,17 @@ mod tests {
     #[test]
     fn utf8_preserved() {
         assert_eq!(sanitize_paste("中文\r\n测试", false), "中文\r测试");
+    }
+
+    /// PASTE-003:仅在未开启 bracketed paste、含换行且开关开启时需要确认
+    #[test]
+    fn paste_003_needs_confirm_only_when_required() {
+        assert!(needs_multiline_confirm(false, "a\nb", true));
+        // bracketed paste 已开启:不需要
+        assert!(!needs_multiline_confirm(true, "a\nb", true));
+        // 不含换行:不需要
+        assert!(!needs_multiline_confirm(false, "abc", true));
+        // 确认开关关闭:不需要
+        assert!(!needs_multiline_confirm(false, "a\nb", false));
     }
 }

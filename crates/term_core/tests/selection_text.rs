@@ -11,6 +11,8 @@ use alacritty_terminal::term::test::TermSize;
 use alacritty_terminal::term::{Config, Term};
 use alacritty_terminal::vte::ansi::Processor;
 
+use term_core::selection::trim_selection_text;
+
 const COLS: usize = 20;
 const ROWS: usize = 5;
 
@@ -27,11 +29,7 @@ fn term_with(input: &str) -> Term<VoidListener> {
 }
 
 /// 设置普通(线性)选区,起点在左上、终点在右下。
-fn select(
-    term: &mut Term<VoidListener>,
-    start: (i32, usize),
-    end: (i32, usize),
-) {
+fn select(term: &mut Term<VoidListener>, start: (i32, usize), end: (i32, usize)) {
     let mut selection = Selection::new(
         SelectionType::Simple,
         Point::new(Line(start.0), Column(start.1)),
@@ -92,4 +90,19 @@ fn wide_char_not_duplicated() {
     select(&mut term, (0, 0), (0, 3));
     let text = term.selection_to_string().unwrap_or_default();
     assert_eq!(text, "中文");
+}
+
+/// SEL-012:软换行行不插入换行符(整段为一行),行尾空白经清洗后不残留。
+#[test]
+fn sel_012_soft_wrap_and_trailing_trim() {
+    // 40 个字符在 20 列网格上软换行成两行,末尾带两个空格
+    let content = format!("{}  ", "x".repeat(38));
+    let mut term = term_with(&content);
+    select(&mut term, (0, 0), (1, 19));
+
+    // 软换行:两行之间没有插入换行符
+    let raw = term.selection_to_string().unwrap_or_default();
+    assert_eq!(raw.matches('\n').count(), 0);
+    // 行尾的无样式空格被 alacritty 的 line_length 丢弃,清洗后不残留
+    assert_eq!(trim_selection_text(&raw), "x".repeat(38));
 }

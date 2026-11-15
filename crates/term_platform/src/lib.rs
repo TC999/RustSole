@@ -19,6 +19,21 @@ pub fn platform_info() -> PlatformInfo {
     }
 }
 
+/// 当前平台是否支持系统 PRIMARY 选区(SEL-006)。
+///
+/// 只有 X11/Wayland 等有 PRIMARY 选区概念的平台返回 true;Windows/macOS 没有,
+/// 业务代码据此决定是否把选区缓冲镜像到系统选区。平台分支集中在此(硬性规则 6)。
+pub fn supports_primary_selection() -> bool {
+    #[cfg(any(target_os = "linux", target_os = "freebsd"))]
+    {
+        true
+    }
+    #[cfg(not(any(target_os = "linux", target_os = "freebsd")))]
+    {
+        false
+    }
+}
+
 /// 自绘窗口标题栏时,窗口移动与还原由谁执行。
 ///
 /// 背景:gpui 0.2.2 提供 `WindowControlArea`,Windows 上会把命中框映射为
@@ -141,5 +156,14 @@ mod tests {
         assert_eq!(chrome, WindowChrome::SystemHandled);
         #[cfg(not(target_os = "windows"))]
         assert_eq!(chrome, WindowChrome::AppHandled);
+    }
+
+    /// SEL-006:PRIMARY 选区能力只应在 Linux/FreeBSD 为真
+    #[test]
+    fn sel_006_primary_selection_capability() {
+        #[cfg(any(target_os = "linux", target_os = "freebsd"))]
+        assert!(supports_primary_selection());
+        #[cfg(not(any(target_os = "linux", target_os = "freebsd")))]
+        assert!(!supports_primary_selection());
     }
 }
