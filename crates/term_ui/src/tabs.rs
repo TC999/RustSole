@@ -18,7 +18,7 @@ use std::rc::Rc;
 
 use gpui::prelude::*;
 use gpui::{
-    div, px, rgb, AnyElement, App, ClickEvent, Context, Entity, Focusable, IntoElement,
+    canvas, div, px, rgb, AnyElement, App, ClickEvent, Context, Entity, Focusable, IntoElement,
     MouseButton, MouseDownEvent, MouseMoveEvent, Pixels, Point, Render, SharedString, Window,
 };
 
@@ -285,59 +285,6 @@ impl Render for TabsView {
             .map(|tab| tab.read(cx).title())
             .unwrap_or_else(|| SharedString::from(DEFAULT_TAB_TITLE));
 
-        // 窗口级移动监听:标签条空白处按下后,位移超过阈值才发起窗口拖动。
-        //
-        // 为什么必须用窗口级而不是元素级:元素级 on_mouse_move 带 hitbox.is_hovered
-        // 过滤(gpui 0.2.2 div.rs:269),指针一移出空白区就收不到事件,拖动发不起来。
-        // 为什么不在按下时直接发起:Windows 的 begin_window_drag 内部
-        // SendMessageW(WM_NCLBUTTONDOWN) 会阻塞到用户松开(term_platform/win32.rs:160),
-        // 那样双击空白新建标签(MOUSE-005)的第二下永远等不到。
-        {
-            let entity = cx.entity();
-            window.on_mouse_event(move |event: &MouseMoveEvent, phase, window, cx| {
-                if phase != gpui::DispatchPhase::Bubble {
-                    return;
-                }
-                // 左键已松开:放弃这次潜在拖动,回到点击语义
-                let pressed = event.pressed_button == Some(MouseButton::Left);
-                // 在同一个 update 里读取起点并按需清空,避免在回调里多次借用同一实体
-                let should_drag = entity.update(cx, |view, _| {
-                    let Some(origin) = view.drag_pending else {
-                        return false;
-                    };
-                    if !pressed {
-                        view.drag_pending = None;
-                        return false;
-                    }
-                    let dx: f32 = f32::from(event.position.x) - f32::from(origin.x);
-                    let dy: f32 = f32::from(event.position.y) - f32::from(origin.y);
-                    if dx * dx + dy * dy < DRAG_THRESHOLD * DRAG_THRESHOLD {
-                        return false;
-                    }
-                    // 超过阈值:清掉待拖动状态,交给系统拖动循环(阻塞到用户松开)
-                    view.drag_pending = None;
-                    true
-                });
-                if should_drag {
-                    crate::view::start_window_drag(window);
-                }
-            });
-        }
-
-        // 左键抬起即清除待拖动状态。
-        //
-        // 不这样做的话,在空白区按下又原地松手会留下过期的起点;此后在**标签上**
-        // 按下并拖动时,移动事件会用这个旧起点算位移,把"拖标签"误判成"拖窗口"。
-        {
-            let entity = cx.entity();
-            window.on_mouse_event(move |event: &gpui::MouseUpEvent, phase, _window, cx| {
-                if phase != gpui::DispatchPhase::Bubble || event.button != MouseButton::Left {
-                    return;
-                }
-                entity.update(cx, |view, _| view.drag_pending = None);
-            });
-        }
-
         let items = self.tab_items(cx);
         let hovered_tab = self.hovered_tab;
         let status = self.status.clone();
@@ -394,7 +341,79 @@ impl Render for TabsView {
             })),
         };
 
-        let tabbar = render_tabbar(&items, hovered_tab, handlers).into_any_element();
+        // 标签条外面套一层 canvas,只是为了拿到一个**paint 阶段**的钩子。
+        //
+        // window.on_mouse_event 只能在 paint 期间调用(gpui 0.2.2 window.rs:3425
+        // 的 debug_assert_paint),写在 render 里会直接 panic。
+        // view.rs 的选区监听也是同样做法(画布 paint 闭包内注册)。
+        //
+        // 拖动判定为什么需要窗口级监听:元素级 on_mouse_move 带 hitbox.is_hovered
+        // 过滤(div.rs:269),指针一移出标签条就收不到事件,拖动发不起来。
+        // 为什么不在按下时直接发起:Windows 的 begin_window_drag 内部
+        // SendMessageW(WM_NCLBUTTONDOWN) 会阻塞到用户松开(term_platform/win32.rs:160),
+        // 那样双击空白新建标签(MOUSE-005)的第二下永远等不到。
+        let drag_entity = cx.entity();
+        let drag_hook = canvas(
+            |_bounds, _window, _cx| (),
+            move |_bounds, (), window, _cx| {
+                // 移动:超过阈值才发起拖动
+                let move_entity = drag_entity.clone();
+                window.on_mouse_event(move |event: &MouseMoveEvent, phase, window, cx| {
+                    if phase != gpui::DispatchPhase::Bubble {
+                        return;
+                    }
+                    let pressed = event.pressed_button == Some(MouseButton::Left);
+                    let position = event.position;
+                    let should_drag = move_entity.update(cx, |view, _| {
+                        let Some(origin) = view.drag_pending else {
+                            return false;
+                        };
+                        if !pressed {
+                            view.drag_pending = None;
+                            return false;
+                        }
+                        let dx: f32 = f32::from(position.x) - f32::from(origin.x);
+                        let dy: f32 = f32::from(position.y) - f32::from(origin.y);
+                        if dx * dx + dy * dy < DRAG_THRESHOLD * DRAG_THRESHOLD {
+                            return false;
+                        }
+                        // 超过阈值:清掉待拖动状态,交给系统拖动循环(阻塞到用户松开)
+                        view.drag_pending = None;
+                        true
+                    });
+                    if should_drag {
+                        crate::view::start_window_drag(window);
+                    }
+                });
+
+                // 抬起:清除待拖动状态。
+                // 不清的话,空白处按下又原地松手会留下过期起点,
+                // 之后拖标签会被误判成拖窗口。
+                let up_entity = drag_entity.clone();
+                window.on_mouse_event(move |event: &gpui::MouseUpEvent, phase, _window, cx| {
+                    if phase != gpui::DispatchPhase::Bubble || event.button != MouseButton::Left {
+                        return;
+                    }
+                    up_entity.update(cx, |view, _| view.drag_pending = None);
+                });
+            },
+        )
+        // 只借用它的 paint 时机,不参与布局:绝对定位 + 0 尺寸,
+        // 否则它会作为 flex 兄弟节点占满剩余宽度,把标签条挤走。
+        .absolute()
+        .top(px(0.0))
+        .left(px(0.0))
+        .w(px(0.0))
+        .h(px(0.0));
+
+        let tabbar = div()
+            .relative()
+            .flex_1()
+            .min_w_0()
+            .h_full()
+            .child(render_tabbar(&items, hovered_tab, handlers))
+            .child(drag_hook)
+            .into_any_element();
 
         let titlebar = render_titlebar(
             &TitlebarModel {
