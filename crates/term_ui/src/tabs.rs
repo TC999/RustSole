@@ -23,6 +23,7 @@ use gpui::{
 };
 
 use crate::actions::{CloseActiveTab, CopySelection, NewTab, NextTab, PasteClipboard, PrevTab};
+use crate::menu::{render_menu, MenuEntry, MenuHandlers, MenuHoverHandler, MenuItem, MenuItemId};
 use crate::tabbar::{
     render_tabbar, CloseHover, TabDoubleClickHandler, TabHit, TabItem, TabbarHandlers,
 };
@@ -59,6 +60,10 @@ pub struct TabsView {
     hovered_close: Option<usize>,
     /// 当前悬停的工具栏按钮。None = 没有悬停在任何工具栏按钮上。
     hovered_toolbar: Option<ToolbarButton>,
+    /// 「更多」菜单是否已展开。
+    menu_open: bool,
+    /// 「更多」菜单弹出层的锚点(窗口坐标,取自「≡」按钮)。
+    menu_anchor: Option<Point<Pixels>>,
     /// 在标签条空白处按下左键时的坐标(视口坐标)。
     ///
     /// 只是"可能的拖动起点":位移超过阈值才真正发起窗口拖动。
@@ -99,6 +104,8 @@ impl TabsView {
                 hovered_control: None,
                 hovered_close: None,
                 hovered_toolbar: None,
+                menu_open: false,
+                menu_anchor: None,
                 drag_pending: None,
                 init_cols: cols,
                 init_rows: rows,
@@ -252,7 +259,7 @@ impl TabsView {
     /// 工具栏的呈现数据。
     ///
     /// 只有「新建标签页」「复制」「粘贴」在本阶段可用;「拆分视图」「查找」依赖尚未
-    /// 实现的功能(阶段 3/4),置灰且不响应点击。
+    /// 实现的功能(阶段 3/4),置灰且不响应点击。「更多」菜单在本阶段可用。
     fn toolbar_items(&self) -> Vec<ToolbarItem> {
         [
             ToolbarButton::NewTab,
@@ -260,6 +267,7 @@ impl TabsView {
             ToolbarButton::Copy,
             ToolbarButton::Paste,
             ToolbarButton::Find,
+            ToolbarButton::More,
         ]
         .into_iter()
         .map(|kind| ToolbarItem {
@@ -288,7 +296,9 @@ impl TabsView {
             ToolbarButton::Copy => self.copy_active(cx),
             ToolbarButton::Paste => self.paste_active(window, cx),
             // 其余按钮功能未实现,不应走到这里
-            ToolbarButton::SplitView | ToolbarButton::Find | ToolbarButton::More => {}
+            ToolbarButton::SplitView | ToolbarButton::Find => {}
+            // 「更多」在工具栏层单独处理(需要点击位置作为菜单锚点)
+            ToolbarButton::More => {}
         }
     }
 
@@ -307,6 +317,55 @@ impl TabsView {
         };
         tab.update(cx, |tab, cx| tab.paste_clipboard(window, cx));
     }
+
+    /// 切换「更多」菜单的展开状态。
+    ///
+    /// 菜单是浮层:展开时点击菜单外部要能关掉它,点同一个按钮也能收起。
+    fn toggle_menu(&mut self, anchor: Point<Pixels>, cx: &mut Context<Self>) {
+        if self.menu_open {
+            self.menu_open = false;
+            self.menu_anchor = None;
+        } else {
+            self.menu_open = true;
+            self.menu_anchor = Some(anchor);
+        }
+        cx.notify();
+    }
+
+    /// 关闭「更多」菜单。
+    fn close_menu(&mut self, cx: &mut Context<Self>) {
+        if !self.menu_open {
+            return;
+        }
+        self.menu_open = false;
+        self.menu_anchor = None;
+        cx.notify();
+    }
+
+    /// 执行菜单项的动作。
+    ///
+    /// 菜单项点击后菜单关闭:这是桌面程序的常规行为,避免菜单一直挡着界面。
+    fn activate_menu_item(&mut self, id: &MenuItemId, cx: &mut Context<Self>) {
+        self.close_menu(cx);
+        match id {
+            // 清除回滚历史:交给激活标签执行(它才有 Term 的锁)。
+            MenuItemId::ClearHistory => {
+                let Some(tab) = self.active_tab().cloned() else {
+                    return;
+                };
+                tab.update(cx, |tab, cx| tab.clear_history(cx));
+            }
+            // 输出保存为:弹系统保存对话框,写文件在后台线程。
+            MenuItemId::SaveOutputAs => {
+                let Some(tab) = self.active_tab().cloned() else {
+                    return;
+                };
+                tab.update(cx, |tab, cx| tab.save_output_as(cx));
+            }
+            // 其余菜单项本阶段没有可用功能,不应走到这里。
+            _ => {}
+        }
+    }
 }
 
 /// 某个工具栏按钮在本阶段是否可用。
@@ -317,7 +376,7 @@ impl TabsView {
 pub(crate) fn toolbar_button_enabled(kind: ToolbarButton) -> bool {
     matches!(
         kind,
-        ToolbarButton::NewTab | ToolbarButton::Copy | ToolbarButton::Paste
+        ToolbarButton::NewTab | ToolbarButton::Copy | ToolbarButton::Paste | ToolbarButton::More
     )
 }
 
@@ -557,11 +616,49 @@ impl Render for TabsView {
                     }
                 },
             ));
-            render_toolbar(&items, ToolbarHandlers { click, hover }).into_any_element()
+            // 「更多」按钮:点击位置是菜单的锚点,菜单贴着按钮下边缘展开。
+            let more = Rc::new(cx.listener(|view, position: &Point<Pixels>, _window, cx| {
+                view.toggle_menu(*position, cx);
+            }));
+            render_toolbar(&items, ToolbarHandlers { click, hover, more }).into_any_element()
         };
 
         // 「更多」菜单:浮在窗口内容之上的弹出层。
         //
+        // 菜单关闭的两条路径:点「≡」按钮再次切换、点菜单外部关闭。
+        let menu = match (self.menu_open, self.menu_anchor) {
+            (true, Some(anchor)) => {
+                let click = Rc::new(cx.listener(|view, id: &MenuItemId, _window, cx| {
+                    view.activate_menu_item(id, cx);
+                }));
+                // 子菜单内容本阶段未实现:悬停只保留状态,不做展开。
+                let hover: MenuHoverHandler =
+                    Rc::new(cx.listener(|_view, _hovered: &Option<MenuItemId>, _window, _cx| {}));
+                // 菜单面板直接作为 anchored 元素挂在根节点下:
+                // anchored 自身就是绝对定位层,不需要额外的 overlay 包裹。
+                //
+                // 「点击菜单外关闭」用窗口级监听实现(见 render 的 canvas 钩子):
+                // 浮层铺满窗口会挡住工具栏,菜单开着时反而点不到「≡」按钮。
+                render_menu(
+                    &more_menu_entries(),
+                    &more_menu_items(),
+                    anchor,
+                    layout.0,
+                    MenuHandlers {
+                        click,
+                        hover,
+                        outside_press: {
+                            let entity = cx.entity();
+                            Rc::new(move |_window: &mut Window, cx: &mut App| {
+                                entity.update(cx, |view, cx| view.close_menu(cx));
+                            })
+                        },
+                    },
+                )
+                .into_any_element()
+            }
+            _ => div().into_any_element(),
+        };
 
         // 只渲染激活标签:隐藏的标签不需要布局与绘制,PTY 仍在后台运行。
         //
@@ -622,9 +719,136 @@ impl Render for TabsView {
                     .child(text)
             }))
             .child(div().flex_1().overflow_hidden().child(body))
+            // 菜单浮层放在最后:同级元素按加入顺序绘制,放最后才能盖在终端内容之上。
+            // `deferred` 再推迟一次,确保它晚于所有兄弟节点绘制。
+            .child(gpui::deferred(menu))
     }
 }
 
+pub(crate) fn more_menu_entries() -> Vec<MenuEntry> {
+    vec![
+        MenuEntry::Action(MenuItemId::NewWindow),
+        MenuEntry::Action(MenuItemId::SaveOutputAs),
+        MenuEntry::Separator,
+        MenuEntry::Action(MenuItemId::FullScreen),
+        MenuEntry::Action(MenuItemId::ClearHistory),
+        MenuEntry::Action(MenuItemId::ZoomIn),
+        MenuEntry::Action(MenuItemId::ResetZoom),
+        MenuEntry::Action(MenuItemId::ZoomOut),
+        MenuEntry::Separator,
+        MenuEntry::Action(MenuItemId::NewProfile),
+        MenuEntry::Submenu(MenuItemId::SwitchProfile),
+        MenuEntry::Separator,
+        MenuEntry::Submenu(MenuItemId::View),
+        MenuEntry::Submenu(MenuItemId::Bookmarks),
+        MenuEntry::Submenu(MenuItemId::Plugins),
+        MenuEntry::Submenu(MenuItemId::Settings),
+        MenuEntry::Submenu(MenuItemId::Help),
+        MenuEntry::Separator,
+        MenuEntry::Submenu(MenuItemId::More),
+    ]
+}
+
+/// 「更多」菜单各项的呈现数据。
+///
+/// 只有已接入功能的项可用;其余置灰(用户可见但不可点),等各自阶段落地再启用。
+pub(crate) fn more_menu_items() -> Vec<MenuItem> {
+    let text = |s: &str| SharedString::from(s.to_string());
+    let item = |id: MenuItemId,
+                label: &str,
+                sc: Option<&str>,
+                checkable: bool,
+                enabled: bool,
+                submenu: bool| MenuItem {
+        id,
+        label: text(label),
+        shortcut: sc.map(text),
+        checkable,
+        checked: false,
+        enabled,
+        submenu,
+    };
+    vec![
+        item(
+            MenuItemId::NewWindow,
+            "新建窗口(W)",
+            Some("Ctrl+Shift+N"),
+            false,
+            false,
+            false,
+        ),
+        item(
+            MenuItemId::SaveOutputAs,
+            "输出保存为(A)...",
+            Some("Ctrl+Shift+S"),
+            false,
+            true,
+            false,
+        ),
+        item(
+            MenuItemId::FullScreen,
+            "全屏模式(U)",
+            Some("F11"),
+            true,
+            false,
+            false,
+        ),
+        item(
+            MenuItemId::ClearHistory,
+            "清除回滚历史并重置",
+            Some("Ctrl+Shift+K"),
+            false,
+            true,
+            false,
+        ),
+        item(
+            MenuItemId::ZoomIn,
+            "放大字体",
+            Some("Ctrl++"),
+            false,
+            false,
+            false,
+        ),
+        item(
+            MenuItemId::ResetZoom,
+            "重置字体大小",
+            Some("Ctrl+Alt+0"),
+            false,
+            false,
+            false,
+        ),
+        item(
+            MenuItemId::ZoomOut,
+            "缩小字体",
+            Some("Ctrl+-"),
+            false,
+            false,
+            false,
+        ),
+        item(
+            MenuItemId::NewProfile,
+            "新建配置方案...",
+            None,
+            false,
+            false,
+            false,
+        ),
+        item(
+            MenuItemId::SwitchProfile,
+            "切换配置方案",
+            None,
+            false,
+            false,
+            true,
+        ),
+        item(MenuItemId::View, "视图(V)", None, false, false, true),
+        item(MenuItemId::Bookmarks, "书签(B)", None, false, false, true),
+        item(MenuItemId::Plugins, "插件", None, false, false, true),
+        item(MenuItemId::Settings, "设置(S)", None, false, false, true),
+        item(MenuItemId::Help, "帮助(H)", None, false, false, true),
+        item(MenuItemId::More, "更多", None, false, false, true),
+    ]
+}
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -728,6 +952,7 @@ mod tests {
         assert!(toolbar_button_enabled(ToolbarButton::NewTab));
         assert!(toolbar_button_enabled(ToolbarButton::Copy));
         assert!(toolbar_button_enabled(ToolbarButton::Paste));
+        assert!(toolbar_button_enabled(ToolbarButton::More));
 
         assert!(!toolbar_button_enabled(ToolbarButton::SplitView));
         assert!(!toolbar_button_enabled(ToolbarButton::Find));
@@ -745,6 +970,59 @@ mod tests {
             chrome_height() > TITLEBAR_HEIGHT,
             "工具栏额外占用了一行高度"
         );
+    }
+
+    /// 「更多」菜单:条目顺序固定,子菜单项带箭头。
+    ///
+    /// 顺序是菜单外观的一部分:条目错乱会让用户找不到功能。
+    #[test]
+    fn more_menu_entries_are_in_stable_order() {
+        let entries = more_menu_entries();
+        // 前两项是普通动作,第三项是分隔线。
+        assert_eq!(entries[0], MenuEntry::Action(MenuItemId::NewWindow));
+        assert_eq!(entries[1], MenuEntry::Action(MenuItemId::SaveOutputAs));
+        assert_eq!(entries[2], MenuEntry::Separator);
+        // 「视图」等是子菜单项(带箭头)。
+        let view = entries
+            .iter()
+            .position(|e| *e == MenuEntry::Submenu(MenuItemId::View))
+            .expect("菜单里应有「视图」子菜单项");
+        assert!(view > 0);
+    }
+
+    /// 菜单项:只有已接入功能的项可用,其余置灰。
+    #[test]
+    fn more_menu_items_mark_unavailable_entries_disabled() {
+        let items = more_menu_items();
+        let enabled = |id: MenuItemId| {
+            items
+                .iter()
+                .find(|item| item.id == id)
+                .map(|item| item.enabled)
+        };
+        // 已接入:清除回滚历史、输出保存为。
+        assert_eq!(enabled(MenuItemId::ClearHistory), Some(true));
+        assert_eq!(enabled(MenuItemId::SaveOutputAs), Some(true));
+        // 未接入:新建窗口、全屏模式、字体缩放、配置方案等。
+        assert_eq!(enabled(MenuItemId::NewWindow), Some(false));
+        assert_eq!(enabled(MenuItemId::FullScreen), Some(false));
+        assert_eq!(enabled(MenuItemId::ZoomIn), Some(false));
+        assert_eq!(enabled(MenuItemId::SwitchProfile), Some(false));
+    }
+
+    /// 全屏模式是勾选项(带方框),其余不是。
+    #[test]
+    fn more_menu_only_fullscreen_is_checkable() {
+        let items = more_menu_items();
+        let checkable = |id: MenuItemId| {
+            items
+                .iter()
+                .find(|item| item.id == id)
+                .map(|item| item.checkable)
+        };
+        assert_eq!(checkable(MenuItemId::FullScreen), Some(true));
+        assert_eq!(checkable(MenuItemId::ClearHistory), Some(false));
+        assert_eq!(checkable(MenuItemId::SaveOutputAs), Some(false));
     }
 
     /// 只有一个标签时切换是空操作(不应改变激活下标或崩溃)

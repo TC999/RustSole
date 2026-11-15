@@ -12,7 +12,7 @@
 use std::rc::Rc;
 
 use gpui::prelude::*;
-use gpui::{div, px, rgb, App, Hsla, IntoElement, Window};
+use gpui::{div, px, rgb, App, Hsla, IntoElement, Pixels, Point, Window};
 
 use crate::theme::{
     toolbar, TOOLBAR_BUTTON_HEIGHT, TOOLBAR_BUTTON_PADDING, TOOLBAR_HEIGHT, TOOLBAR_ICON_SIZE,
@@ -52,6 +52,8 @@ pub struct ToolbarItem {
 pub type ToolbarClickHandler = Rc<dyn Fn(&ToolbarButton, &mut Window, &mut App)>;
 /// 工具栏按钮悬停回调(Some = 某个按钮,None = 不在任何按钮上)。
 pub type ToolbarHoverHandler = Rc<dyn Fn(&Option<ToolbarButton>, &mut Window, &mut App)>;
+/// 「更多」按钮点击回调:参数是点击位置(窗口坐标),用于定位弹出菜单。
+pub type ToolbarMoreHandler = Rc<dyn Fn(&Point<Pixels>, &mut Window, &mut App)>;
 
 /// 工具栏回调。
 pub struct ToolbarHandlers {
@@ -59,6 +61,8 @@ pub struct ToolbarHandlers {
     pub click: ToolbarClickHandler,
     /// 悬停的按钮变化(None = 不在任何按钮上)。
     pub hover: ToolbarHoverHandler,
+    /// 「更多」按钮被点击:参数是点击位置(窗口坐标),用于定位弹出菜单。
+    pub more: ToolbarMoreHandler,
 }
 
 /// 渲染应用工具栏。
@@ -134,6 +138,12 @@ fn toolbar_button(item: &ToolbarItem, handlers: &ToolbarHandlers) -> gpui::AnyEl
         button = button
             .cursor_pointer()
             .on_click(move |_event, window, cx| (click)(&kind, window, cx));
+    }
+    // 「更多」按钮:点击位置要传给上层,菜单才能贴着按钮展开。
+    // 它与普通按钮分开处理:菜单锚点需要事件里的坐标,普通按钮不需要。
+    if kind == ToolbarButton::More {
+        let more = Rc::clone(&handlers.more);
+        button = button.on_click(move |event, window, cx| (more)(&event.position(), window, cx));
     }
 
     // 悬停状态由视图持有:按钮只负责上报"鼠标在/不在我上面"。

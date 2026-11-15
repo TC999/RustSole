@@ -4,6 +4,7 @@ pub mod actions;
 pub mod buffer;
 pub mod clipboard;
 pub mod grid;
+pub mod menu;
 pub mod selection;
 pub mod tabbar;
 pub mod tabs;

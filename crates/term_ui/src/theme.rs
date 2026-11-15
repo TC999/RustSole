@@ -82,6 +82,63 @@ pub mod toolbar {
     pub const LABEL: u32 = 0xc8c8c8;
 }
 
+/// 弹出菜单配色。菜单是浮在窗口内容之上的层,底色比工具栏更亮,
+/// 与窗口 chrome 区分开,让用户明确"这是浮层不是窗格"。
+pub mod menu {
+    /// 菜单面板底色。
+    pub const BG: u32 = 0x2b2b2b;
+    /// 菜单项文字颜色。
+    pub const TEXT: u32 = 0xdcdcdc;
+    /// 菜单项不可用时的文字颜色(置灰)。
+    pub const TEXT_DISABLED: u32 = 0x707070;
+    /// 菜单项悬停时的底色。
+    pub const HOVER_BG: u32 = 0x3d3d3d;
+    /// 菜单项图标颜色。
+    pub const ICON: u32 = 0xc0c0c0;
+    /// 菜单项图标不可用时的颜色。
+    pub const ICON_DISABLED: u32 = 0x6a6a6a;
+    /// 分隔线颜色。
+    pub const SEPARATOR: u32 = 0x454545;
+    /// 快捷键文字颜色(比正文暗一档,右对齐显示)。
+    pub const SHORTCUT: u32 = 0x9a9a9a;
+    /// 勾选框边框颜色。
+    pub const CHECKBOX_BORDER: u32 = 0x8a8a8a;
+    /// 勾选框内勾号颜色。
+    pub const CHECKMARK: u32 = 0xdcdcdc;
+}
+
+/// 弹出菜单配色。菜单是浮在窗口内容之上的层,底色比工具栏更亮,
+/// 与窗口 chrome 区分开,让用户明确"这是浮层不是窗格"。
+/// 菜单面板宽度(px)。与 Konsole 的菜单宽度接近,足够放下中文文字与快捷键。
+pub const MENU_WIDTH: f32 = 300.0;
+
+/// 菜单项高度(px)。
+pub const MENU_ITEM_HEIGHT: f32 = 26.0;
+
+/// 菜单面板的内边距(px)。
+pub const MENU_PADDING: f32 = 4.0;
+
+/// 菜单项左右内边距(px)。
+pub const MENU_ITEM_PADDING: f32 = 10.0;
+
+/// 菜单图标尺寸(px)。
+pub const MENU_ICON_SIZE: f32 = 16.0;
+
+/// 菜单项之间的图标与文字间距(px)。
+pub const MENU_ITEM_GAP: f32 = 8.0;
+
+/// 菜单分隔线的高度(px)。
+pub const MENU_SEPARATOR_HEIGHT: f32 = 1.0;
+
+/// 分隔线上下的留白(px)。
+pub const MENU_SEPARATOR_MARGIN: f32 = 5.0;
+
+/// 菜单弹出时与锚点按钮的垂直间距(px)。
+pub const MENU_ANCHOR_OFFSET: f32 = 2.0;
+
+/// 子菜单相对父菜单的横向偏移(px)。
+pub const SUBMENU_OFFSET: f32 = 4.0;
+
 /// 应用工具栏高度(px)。不计入终端网格行数,但会占用客户区高度(WIN-007)。
 pub const TOOLBAR_HEIGHT: f32 = 34.0;
 

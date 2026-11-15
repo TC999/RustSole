@@ -20,6 +20,7 @@ use gpui::{
 use alacritty_terminal::grid::{Dimensions as _, Scroll};
 use alacritty_terminal::index::{Column, Line, Point as TermPoint, Side};
 use alacritty_terminal::selection::{Selection, SelectionType};
+use alacritty_terminal::term::cell::Flags;
 use alacritty_terminal::term::TermMode;
 
 use term_config::Config;
@@ -121,6 +122,8 @@ pub struct TerminalView {
     keyboard_focus: Option<TermPoint>,
     /// 等待确认的多行粘贴(PASTE-003);None 表示没有待确认粘贴。
     paste_pending: Option<PendingPaste>,
+    /// 保存输出失败等可恢复错误的提示文字;None 表示没有错误。
+    file_error: Option<SharedString>,
     /// 终端画布在视口中的左上角(逻辑像素),每次绘制时由 canvas 回填。
     /// 鼠标事件给的是视口坐标,换算单元格必须减去这个偏移。
     /// 用 `Cell` 而不是字段直接赋值:paint 闭包只拿到共享引用,不能改视图字段。
@@ -177,6 +180,7 @@ impl TerminalView {
             keyboard_anchor: None,
             keyboard_focus: None,
             paste_pending: None,
+            file_error: None,
             canvas_origin: Rc::new(Cell::new((0.0, 0.0))),
         });
 
@@ -917,6 +921,80 @@ impl TerminalView {
         self.send_paste(text, bracketed, cx);
     }
 
+    /// 清除回滚历史:丢弃已回看过的历史行。
+    ///
+    /// 对应 Konsole 菜单的「清除回滚历史并重置」。这里只清历史,不动当前屏幕内容。
+    pub fn clear_history(&mut self, cx: &mut Context<Self>) {
+        {
+            let mut term = self.session.term.lock();
+            term.grid_mut().clear_history();
+        }
+        // 历史变了,快照与滚动条状态都要重算
+        self.refresh_snapshot();
+        self.refresh_scrollbar_state();
+        cx.notify();
+    }
+
+    /// 导出当前终端的全部内容(含回滚历史)为纯文本。
+    ///
+    /// 每行按单元格内容拼接,行尾空白裁掉(与 SEL-012 一致),空行保留。
+    /// 返回 `None`:网格尺寸无效(尚未测量出列宽)或没有任何内容。
+    fn export_text(&self) -> Option<String> {
+        let term = self.session.term.lock();
+        let grid = term.grid();
+        let top = grid.topmost_line().0;
+        let bottom = grid.bottommost_line().0;
+        let last_col = grid.last_column().0;
+        if bottom < top {
+            return None;
+        }
+        let mut out = String::new();
+        for line in top..=bottom {
+            let row = &grid[Line(line)];
+            let mut text = String::new();
+            for col in 0..=last_col {
+                let cell = &row[Column(col)];
+                // 宽字符的占位格(spacer)不重复输出
+                if cell.flags.contains(Flags::WIDE_CHAR_SPACER) {
+                    continue;
+                }
+                text.push(cell.c);
+            }
+            out.push_str(text.trim_end());
+            out.push('\n');
+        }
+        Some(out)
+    }
+
+    /// 把终端内容保存到文件(菜单的「输出保存为」)。
+    ///
+    /// 先弹系统保存对话框,拿到路径后在后台线程写文件(不阻塞 UI 线程)。
+    pub fn save_output_as(&mut self, cx: &mut Context<Self>) {
+        let Some(text) = self.export_text() else {
+            return;
+        };
+        let directory = std::env::current_dir().unwrap_or_else(|_| std::path::PathBuf::from("."));
+        let receiver = cx.prompt_for_new_path(&directory, Some("terminal-output.txt"));
+        cx.spawn(async move |weak, cx| {
+            let path = match receiver.await {
+                Ok(Ok(Some(path))) => path,
+                // 用户取消或对话框出错:不写文件,也不报错。
+                _ => return,
+            };
+            // 文件写入在后台线程做,不能占用 UI 主线程(ARCHITECTURE.md 线程模型)。
+            let write = cx.background_spawn(async move { std::fs::write(&path, text) });
+            let result = write.await;
+            if let Err(err) = result {
+                // 写文件失败属于用户可恢复的错误:显示在界面上,不 panic。
+                weak.update(cx, |view, cx| {
+                    view.file_error = Some(SharedString::from(format!("保存输出失败: {err}")));
+                    cx.notify();
+                })
+                .ok();
+            }
+        })
+        .detach();
+    }
     /// 键盘焦点移入这个标签的终端。
     pub fn focus_terminal(&self, window: &mut Window) {
         self.focus.focus(window);
