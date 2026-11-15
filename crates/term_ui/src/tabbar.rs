@@ -11,7 +11,9 @@ use std::rc::Rc;
 use gpui::prelude::*;
 use gpui::{div, px, rgb, App, Hsla, IntoElement, MouseButton, SharedString, Window};
 
-use crate::theme::{tabbar, NEW_TAB_BUTTON_WIDTH, TAB_MAX_WIDTH, TAB_MIN_WIDTH, TITLEBAR_HEIGHT};
+use crate::theme::{
+    tabbar, NEW_TAB_BUTTON_WIDTH, TAB_CLOSE_WIDTH, TAB_MAX_WIDTH, TAB_MIN_WIDTH, TITLEBAR_HEIGHT,
+};
 
 /// 一个标签在标签条上的呈现数据(全部来自视图状态,不含 gpui 句柄)。
 #[derive(Debug, Clone)]
@@ -22,13 +24,17 @@ pub struct TabItem {
     pub active: bool,
     /// 子进程是否已退出(文字变暗提示)。
     pub exited: bool,
+    /// 指针是否正悬停在该标签的关闭图标上(决定图标高亮)。
+    pub close_hovered: bool,
 }
 
 /// 标签条上可被点击的目标。
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum TabHit {
-    /// 第 index 个标签。
+    /// 第 index 个标签(切换)。
     Select(usize),
+    /// 第 index 个标签上的关闭图标。
+    Close(usize),
     /// 「新建标签」按钮。
     NewTab,
 }
@@ -41,6 +47,18 @@ type TabMiddleHandler = Rc<dyn Fn(&Option<usize>, &mut Window, &mut App)>;
 pub type TabDoubleClickHandler = Rc<dyn Fn(&mut Window, &mut App)>;
 /// 悬停回调(Some = 某个标签,None = 不在任何标签上)。
 type TabHoverHandler = Rc<dyn Fn(&Option<usize>, &mut Window, &mut App)>;
+
+/// 关闭图标悬停回调。
+type TabCloseHoverHandler = Rc<dyn Fn(&CloseHover, &mut Window, &mut App)>;
+
+/// 关闭图标的悬停状态。
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct CloseHover {
+    /// 标签下标。
+    pub index: usize,
+    /// 指针是否在关闭图标上。
+    pub hovered: bool,
+}
 
 /// 标签条回调。
 ///
@@ -55,6 +73,8 @@ pub struct TabbarHandlers {
     pub double_click_blank: TabDoubleClickHandler,
     /// 悬停的标签变化。
     pub hover: TabHoverHandler,
+    /// 某个标签的关闭图标悬停变化。
+    pub close_hover: TabCloseHoverHandler,
 }
 
 /// 渲染标签条(标题栏左半部分,占据窗口控制按钮以外的宽度)。
@@ -141,6 +161,7 @@ fn tab_element(
     hovered: bool,
     handlers: &TabbarHandlers,
 ) -> gpui::AnyElement {
+    let close_hovered = item.close_hovered;
     let (bg, text_color): (Hsla, Hsla) = if item.active {
         (
             rgb(tabbar::ACTIVE_BG).into(),
@@ -161,11 +182,67 @@ fn tab_element(
     let middle = Rc::clone(&handlers.middle);
     let hover = Rc::clone(&handlers.hover);
 
-    div()
-        .id(("tab", index))
+    // 关闭图标的配色:悬停在图标上时才高亮。
+    // 是否悬停由视图状态决定并作为参数传入(与标签悬停同一套机制),
+    // 这样重绘时机与标签高亮一致,不需要额外的共享可变状态。
+    let (close_bg, close_color): (Hsla, Hsla) = if close_hovered {
+        (
+            rgb(tabbar::CLOSE_ICON_HOVER_BG).into(),
+            rgb(tabbar::CLOSE_ICON_HOVER).into(),
+        )
+    } else {
+        (rgb(tabbar::BG).into(), rgb(tabbar::CLOSE_ICON).into())
+    };
+
+    // 关闭图标:放在标签右端。
+    //
+    // 关键点是 occlude():它把该 hitbox 标记为 BlockMouse,命中测试遇到它即停止
+    // (gpui 0.2.2 window.rs:788-790),外层标签的 hitbox 因此不在命中集合里,
+    // 标签的 on_click(切换)不会跟着触发。没有它,点关闭会先切到该标签再关闭,
+    // 表现为"点关闭时画面闪一下"。
+    let close_click = Rc::clone(&handlers.click);
+    let close_hover = Rc::clone(&handlers.close_hover);
+    let close_button = div()
+        .id(("tab-close", index))
         .flex()
         .items_center()
         .justify_center()
+        .flex_shrink_0()
+        .w(px(TAB_CLOSE_WIDTH))
+        .h_full()
+        .occlude()
+        .cursor_pointer()
+        .on_click(move |_event, window, cx| (close_click)(&TabHit::Close(index), window, cx))
+        .on_hover(move |&is_hovered, window, cx| {
+            (close_hover)(
+                &CloseHover {
+                    index,
+                    hovered: is_hovered,
+                },
+                window,
+                cx,
+            );
+        })
+        .child(
+            div()
+                .w(px(14.0))
+                .h(px(14.0))
+                .flex()
+                .items_center()
+                .justify_center()
+                // 常态不显示底色,悬停时用圆形底色提示可点(见下方 on_hover)
+                .rounded(px(3.0))
+                .bg(close_bg)
+                .text_size(px(12.0))
+                .text_color(close_color)
+                .child("✕"),
+        );
+
+    div()
+        .id(("tab", index))
+        .flex()
+        .flex_row()
+        .items_center()
         // 左侧分隔线:与 titlebar.rs 一致,用 border 而不是额外元素,不影响布局宽度
         .border_l_1()
         .border_color(rgb(tabbar::SEPARATOR))
@@ -187,14 +264,18 @@ fn tab_element(
                 (hover)(&Some(index), window, cx);
             }
         })
+        // 标题占满图标以外的宽度;min_w_0 让长标题截断而不是把关闭图标挤出标签
         .child(
             div()
-                .px(px(10.0))
+                .flex_1()
+                .min_w_0()
+                .pl(px(10.0))
                 .text_sm()
                 .overflow_hidden()
                 .whitespace_nowrap()
                 .text_color(text_color)
                 .child(item.title.clone()),
         )
+        .child(close_button)
         .into_any_element()
 }

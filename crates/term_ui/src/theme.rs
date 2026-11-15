@@ -57,6 +57,12 @@ pub mod tabbar {
     pub const NEW_TAB_ICON: u32 = 0xb0b0b0;
     /// 子进程已退出、但标签尚未关闭时的文字颜色(提示用户该标签已无进程)。
     pub const EXITED_TEXT: u32 = 0x7a7a7a;
+    /// 标签上关闭图标的常态颜色。
+    pub const CLOSE_ICON: u32 = 0x9a9a9a;
+    /// 标签上关闭图标悬停时的颜色(提及可点击,与常态拉开对比)。
+    pub const CLOSE_ICON_HOVER: u32 = 0xffffff;
+    /// 标签上关闭图标悬停时的圆形底色。
+    pub const CLOSE_ICON_HOVER_BG: u32 = 0x4a4a4a;
 }
 
 /// 「新建标签」按钮的宽度(px)。
@@ -67,6 +73,9 @@ pub const TAB_MIN_WIDTH: f32 = 90.0;
 
 /// 单个标签的最大宽度(px)。标签少时不会把标题拉成一整行。
 pub const TAB_MAX_WIDTH: f32 = 220.0;
+
+/// 标签内关闭图标的点击区宽度(px)。
+pub const TAB_CLOSE_WIDTH: f32 = 20.0;
 
 /// 标题栏高度(px)。与窗口控制按钮宽度一致时按钮是正方形热区。
 pub const TITLEBAR_HEIGHT: f32 = 32.0;

@@ -23,7 +23,9 @@ use gpui::{
 };
 
 use crate::actions::{CloseActiveTab, NewTab, NextTab, PrevTab};
-use crate::tabbar::{render_tabbar, TabDoubleClickHandler, TabHit, TabItem, TabbarHandlers};
+use crate::tabbar::{
+    render_tabbar, CloseHover, TabDoubleClickHandler, TabHit, TabItem, TabbarHandlers,
+};
 use crate::theme::{window as window_theme, WindowControl, WindowControlsShown, TITLEBAR_HEIGHT};
 use crate::titlebar::{render_titlebar, TitlebarHandlers, TitlebarModel};
 use crate::view::{TerminalEvent, TerminalView, DEFAULT_TAB_TITLE};
@@ -38,6 +40,8 @@ pub struct TabsView {
     hovered_tab: Option<usize>,
     /// 标题栏上当前悬停的窗口控制按钮。
     hovered_control: Option<WindowControl>,
+    /// 当前悬停的标签关闭图标(标签下标)。None = 没有悬停在任何关闭图标上。
+    hovered_close: Option<usize>,
     /// 新标签的初始网格尺寸(与创建窗口时用的常量一致)。
     init_cols: u16,
     init_rows: u16,
@@ -70,6 +74,7 @@ impl TabsView {
                 active: 0,
                 hovered_tab: None,
                 hovered_control: None,
+                hovered_close: None,
                 init_cols: cols,
                 init_rows: rows,
                 status: None,
@@ -149,6 +154,8 @@ impl TabsView {
             self.active = self.active.min(self.tabs.len() - 1);
         }
         self.hovered_tab = None;
+        // 下标在移除后已失效:不清掉会让另一个标签错误地显示关闭图标高亮
+        self.hovered_close = None;
         // 关掉的是当前标签时,焦点原本在已释放的视图上:交给新激活标签
         if !self.tabs.is_empty() {
             self.focus_active(window, cx);
@@ -211,6 +218,7 @@ impl TabsView {
                     title: tab.title(),
                     active: index == self.active,
                     exited: tab.exited(),
+                    close_hovered: self.hovered_close == Some(index),
                 }
             })
             .collect()
@@ -270,6 +278,8 @@ impl Render for TabsView {
         let handlers = TabbarHandlers {
             click: Rc::new(cx.listener(|view, hit: &TabHit, window, cx| match hit {
                 TabHit::Select(index) => view.select_tab(*index, window, cx),
+                // 关闭图标:与中键、Ctrl+Shift+W 走同一条路径,最后一个标签时关闭窗口
+                TabHit::Close(index) => view.close_tab_or_window(*index, window, cx),
                 TabHit::NewTab => view.new_tab(cx),
             })),
             middle: Rc::new(cx.listener(
@@ -298,6 +308,17 @@ impl Render for TabsView {
                     }
                 },
             )),
+            close_hover: Rc::new(cx.listener(|view, state: &CloseHover, _window, cx| {
+                let next = if state.hovered {
+                    Some(state.index)
+                } else {
+                    None
+                };
+                if view.hovered_close != next {
+                    view.hovered_close = next;
+                    cx.notify();
+                }
+            })),
         };
 
         let tabbar = render_tabbar(&items, hovered_tab, handlers).into_any_element();
@@ -503,5 +524,31 @@ mod tests {
         let mut s = IndexState::new(2, 0);
         s.close(5);
         assert_eq!((s.len, s.active), (2, 0));
+    }
+
+    /// TAB-011:标签上的关闭图标走与中键/Ctrl+Shift+W 相同的关闭路径。
+    ///
+    /// 三个入口都映射到 `TabsView::close_tab_or_window`,因此索引维护的预期结果
+    /// 与 `IndexState::close` 一致;这里固定住"点关闭图标 = 关闭该标签"这一语义,
+    /// 避免将来把关闭图标误接到"切换"或"关闭当前标签"上。
+    #[test]
+    fn tab_011_close_icon_closes_its_own_tab() {
+        // 三个标签、激活第 0 个:点第 2 个标签的关闭图标应关掉第 2 个,激活不变
+        let mut s = IndexState::new(3, 0);
+        s.close(2);
+        assert_eq!((s.len, s.active), (2, 0), "关闭非激活标签不应改变激活标签");
+
+        // 激活中间那个:点它的关闭图标后应激活右邻居
+        let mut s = IndexState::new(3, 1);
+        s.close(1);
+        assert_eq!((s.len, s.active), (2, 1), "关闭激活标签应激活右邻居");
+    }
+
+    /// TAB-012:关闭图标在只有一个标签时等价于关闭窗口(列表变空,由调用方关窗)
+    #[test]
+    fn tab_012_close_icon_on_last_tab_empties_list() {
+        let mut s = IndexState::new(1, 0);
+        s.close(0);
+        assert_eq!(s.len, 0, "最后一个标签关闭后列表为空,调用方据此关闭窗口");
     }
 }

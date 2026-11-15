@@ -446,7 +446,6 @@ impl TerminalView {
         self.scrollbar_ratio = thumb_ratio(offset, history);
     }
 
-
     /// 不变量 2:锁内只取快照,立即释放。
     fn refresh_snapshot(&mut self) {
         let guard = self.session.term.lock();
