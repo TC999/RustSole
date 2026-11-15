@@ -19,7 +19,7 @@ use std::rc::Rc;
 use gpui::prelude::*;
 use gpui::{
     div, px, rgb, AnyElement, App, ClickEvent, Context, Entity, Focusable, IntoElement,
-    MouseDownEvent, Render, SharedString, Window,
+    MouseButton, MouseDownEvent, MouseMoveEvent, Pixels, Point, Render, SharedString, Window,
 };
 
 use crate::actions::{CloseActiveTab, NewTab, NextTab, PrevTab};
@@ -29,6 +29,12 @@ use crate::tabbar::{
 use crate::theme::{window as window_theme, WindowControl, WindowControlsShown, TITLEBAR_HEIGHT};
 use crate::titlebar::{render_titlebar, TitlebarHandlers, TitlebarModel};
 use crate::view::{TerminalEvent, TerminalView, DEFAULT_TAB_TITLE};
+
+/// 判定"用户想拖动窗口"的位移阈值(逻辑像素)。
+///
+/// 低于它视为手抖,仍按点击处理,保证双击空白新建标签(MOUSE-005)可用。
+/// 取 4px,与 gpui 自身的 DRAG_THRESHOLD(2px,div.rs:47)同量级。
+const DRAG_THRESHOLD: f32 = 4.0;
 
 /// 标签页容器视图。
 pub struct TabsView {
@@ -42,6 +48,12 @@ pub struct TabsView {
     hovered_control: Option<WindowControl>,
     /// 当前悬停的标签关闭图标(标签下标)。None = 没有悬停在任何关闭图标上。
     hovered_close: Option<usize>,
+    /// 在标签条空白处按下左键时的坐标(视口坐标)。
+    ///
+    /// 只是"可能的拖动起点":位移超过阈值才真正发起窗口拖动。
+    /// 不能在按下时就发起 —— Windows 的 begin_window_drag 会阻塞到鼠标松开,
+    /// 那样双击空白新建标签就永远等不到第二下。
+    drag_pending: Option<Point<Pixels>>,
     /// 新标签的初始网格尺寸(与创建窗口时用的常量一致)。
     init_cols: u16,
     init_rows: u16,
@@ -75,6 +87,7 @@ impl TabsView {
                 hovered_tab: None,
                 hovered_control: None,
                 hovered_close: None,
+                drag_pending: None,
                 init_cols: cols,
                 init_rows: rows,
                 status: None,
@@ -272,6 +285,59 @@ impl Render for TabsView {
             .map(|tab| tab.read(cx).title())
             .unwrap_or_else(|| SharedString::from(DEFAULT_TAB_TITLE));
 
+        // 窗口级移动监听:标签条空白处按下后,位移超过阈值才发起窗口拖动。
+        //
+        // 为什么必须用窗口级而不是元素级:元素级 on_mouse_move 带 hitbox.is_hovered
+        // 过滤(gpui 0.2.2 div.rs:269),指针一移出空白区就收不到事件,拖动发不起来。
+        // 为什么不在按下时直接发起:Windows 的 begin_window_drag 内部
+        // SendMessageW(WM_NCLBUTTONDOWN) 会阻塞到用户松开(term_platform/win32.rs:160),
+        // 那样双击空白新建标签(MOUSE-005)的第二下永远等不到。
+        {
+            let entity = cx.entity();
+            window.on_mouse_event(move |event: &MouseMoveEvent, phase, window, cx| {
+                if phase != gpui::DispatchPhase::Bubble {
+                    return;
+                }
+                // 左键已松开:放弃这次潜在拖动,回到点击语义
+                let pressed = event.pressed_button == Some(MouseButton::Left);
+                // 在同一个 update 里读取起点并按需清空,避免在回调里多次借用同一实体
+                let should_drag = entity.update(cx, |view, _| {
+                    let Some(origin) = view.drag_pending else {
+                        return false;
+                    };
+                    if !pressed {
+                        view.drag_pending = None;
+                        return false;
+                    }
+                    let dx: f32 = f32::from(event.position.x) - f32::from(origin.x);
+                    let dy: f32 = f32::from(event.position.y) - f32::from(origin.y);
+                    if dx * dx + dy * dy < DRAG_THRESHOLD * DRAG_THRESHOLD {
+                        return false;
+                    }
+                    // 超过阈值:清掉待拖动状态,交给系统拖动循环(阻塞到用户松开)
+                    view.drag_pending = None;
+                    true
+                });
+                if should_drag {
+                    crate::view::start_window_drag(window);
+                }
+            });
+        }
+
+        // 左键抬起即清除待拖动状态。
+        //
+        // 不这样做的话,在空白区按下又原地松手会留下过期的起点;此后在**标签上**
+        // 按下并拖动时,移动事件会用这个旧起点算位移,把"拖标签"误判成"拖窗口"。
+        {
+            let entity = cx.entity();
+            window.on_mouse_event(move |event: &gpui::MouseUpEvent, phase, _window, cx| {
+                if phase != gpui::DispatchPhase::Bubble || event.button != MouseButton::Left {
+                    return;
+                }
+                entity.update(cx, |view, _| view.drag_pending = None);
+            });
+        }
+
         let items = self.tab_items(cx);
         let hovered_tab = self.hovered_tab;
         let status = self.status.clone();
@@ -318,6 +384,13 @@ impl Render for TabsView {
                     view.hovered_close = next;
                     cx.notify();
                 }
+            })),
+            // WIN-002:标题栏空白处拖动窗口。
+            //
+            // 按下只记录起点;真正的发起交给窗口级移动监听(阈值判定),原因见该处注释。
+            drag_pressed: Rc::new(cx.listener(|view, origin: &Point<Pixels>, _window, cx| {
+                view.drag_pending = Some(*origin);
+                cx.notify();
             })),
         };
 

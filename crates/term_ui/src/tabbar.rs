@@ -9,7 +9,9 @@
 use std::rc::Rc;
 
 use gpui::prelude::*;
-use gpui::{div, px, rgb, App, Hsla, IntoElement, MouseButton, SharedString, Window};
+use gpui::{
+    div, px, rgb, App, Hsla, IntoElement, MouseButton, Pixels, Point, SharedString, Window,
+};
 
 use crate::theme::{
     tabbar, NEW_TAB_BUTTON_WIDTH, TAB_CLOSE_WIDTH, TAB_MAX_WIDTH, TAB_MIN_WIDTH, TITLEBAR_HEIGHT,
@@ -50,6 +52,8 @@ type TabHoverHandler = Rc<dyn Fn(&Option<usize>, &mut Window, &mut App)>;
 
 /// 关闭图标悬停回调。
 type TabCloseHoverHandler = Rc<dyn Fn(&CloseHover, &mut Window, &mut App)>;
+/// 空白区左键按下回调:记录拖动起点(坐标)。
+pub type TabDragPressedHandler = Rc<dyn Fn(&Point<Pixels>, &mut Window, &mut App)>;
 
 /// 关闭图标的悬停状态。
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -71,6 +75,9 @@ pub struct TabbarHandlers {
     pub middle: TabMiddleHandler,
     /// 标签条空白处双击。
     pub double_click_blank: TabDoubleClickHandler,
+    /// 标签条空白处按下左键:记录可能的拖动起点(WIN-002)。
+    /// 位移超过阈值后由视图真正发起拖动。
+    pub drag_pressed: TabDragPressedHandler,
     /// 悬停的标签变化。
     pub hover: TabHoverHandler,
     /// 某个标签的关闭图标悬停变化。
@@ -93,7 +100,10 @@ pub fn render_tabbar(
         .flex_row()
         .items_center()
         .h_full()
-        .flex_shrink_0();
+        // 允许收缩:标签多到放不下时压窄标签(标签自身 min_w 兜底),
+        // 把空间留给右侧的拖动区。
+        .flex_shrink()
+        .min_w_0();
 
     for (index, item) in items.iter().enumerate() {
         strip = strip.child(tab_element(index, item, hovered == Some(index), &handlers));
@@ -117,14 +127,35 @@ pub fn render_tabbar(
                 .child("+"),
         );
 
-    // 空白区:吃掉标签与「+」以外的宽度。中键新建、双击新建(MOUSE-004/005)。
+    // 空白区:标签与「+」以外的全部宽度。
+    //
+    // 同时承担两件事:窗口拖动(WIN-002)与双击新建标签(MOUSE-005)。
+    // 二者不能都在鼠标按下时完成 —— Windows 的 begin_window_drag 内部是
+    // SendMessageW(WM_NCLBUTTONDOWN),会**同步阻塞**到用户松开鼠标
+    // (见 term_platform/win32.rs:160),若在 mouse_down 就发起拖动,
+    // 双击的第二下永远等不到,双击新建会失效。
+    //
+    // 因此拖动改为"按下后移动超过阈值才发起":单击/双击走点击路径,
+    // 按住并移动走拖动路径,两者互不吞并。
+    //
+    // 移动判定必须用**窗口级**监听:元素级 on_mouse_move 带 hitbox.is_hovered
+    // 过滤(div.rs:269),指针一旦移出空白区就再也收不到事件,拖动永远发不起来。
     let middle = Rc::clone(&handlers.middle);
     let double_click = Rc::clone(&handlers.double_click_blank);
     let hover = Rc::clone(&handlers.hover);
+    let press = Rc::clone(&handlers.drag_pressed);
+
     let blank = div()
         .id("tabbar-blank")
         .flex_1()
+        .min_w_0()
         .h_full()
+        // 左键按下只记录"可能的拖动起点",不立即发起拖动:
+        // 立即发起会阻塞到鼠标松开(Windows 的 SendMessageW),把双击新建吞掉。
+        // 真正的发起由 TabsView 的窗口级移动监听在位移超过阈值时完成。
+        .on_mouse_down(MouseButton::Left, move |event, window, cx| {
+            (press)(&event.position, window, cx)
+        })
         .on_mouse_down(MouseButton::Middle, move |_event, window, cx| {
             (middle)(&None, window, cx)
         })
@@ -140,12 +171,17 @@ pub fn render_tabbar(
             }
         });
 
+    // 布局要点:标签区(strip + 「+」)按内容宽度排布且**不参与拉伸**,
+    // 剩余宽度全部让给空白拖动区。这样标签少时拖动区很宽,标签多时先挤压标签
+    // 宽度(标签自身 flex_shrink),而不是把拖动区的最后一点空间也吃掉——
+    // 否则标签一多窗口就再也拖不动。
     div()
         .id("tabbar")
         .flex()
         .flex_row()
         .items_center()
         .flex_1()
+        .min_w_0()
         .h(px(TITLEBAR_HEIGHT))
         .overflow_hidden()
         .bg(rgb(tabbar::BG))
