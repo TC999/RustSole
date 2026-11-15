@@ -9,4 +9,5 @@ pub mod tabbar;
 pub mod tabs;
 pub mod theme;
 pub mod titlebar;
+pub mod toolbar;
 pub mod view;

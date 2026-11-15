@@ -866,6 +866,57 @@ impl TerminalView {
         cx.notify();
     }
 
+    /// 复制当前选区到系统剪贴板(KEY-001)。
+    ///
+    /// 复制的是**当前高亮选区**,不是选区缓冲:选区缓冲里可能保存着更早一次选中的
+    /// 内容(SEL-003 规定取消高亮不清空缓冲),复制到系统剪贴板应反映用户此刻看到的选区。
+    /// 没有选区时不写剪贴板,也不报错。
+    pub fn copy_selection(&mut self, cx: &mut Context<Self>) {
+        let text = {
+            let term = self.session.term.lock();
+            term.selection_to_string()
+        };
+        let Some(text) = text else {
+            return;
+        };
+        let cleaned = trim_selection_text(&text);
+        if cleaned.is_empty() {
+            // 空选区不写剪贴板:避免把上一次的剪贴板内容清掉
+            return;
+        }
+        cx.write_to_clipboard(gpui::ClipboardItem::new_string(cleaned));
+        cx.notify();
+    }
+
+    /// 把系统剪贴板内容粘贴到终端(KEY-002)。
+    ///
+    /// 与中键粘贴选区缓冲走**同一个**清洗函数与同一条确认流程(PASTE-*):
+    /// 两条通道只差文本来源,规则必须一致。
+    pub fn paste_clipboard(&mut self, window: &mut Window, cx: &mut Context<Self>) {
+        let Some(item) = cx.read_from_clipboard() else {
+            // 剪贴板为空:不发送任何字节(发送空输入会让终端挂起)
+            return;
+        };
+        let Some(text) = item.text() else {
+            // 剪贴板里只有图片等非文本内容:终端无法粘贴
+            return;
+        };
+        if text.is_empty() {
+            return;
+        };
+        let bracketed = {
+            let term = self.session.term.lock();
+            term.mode().contains(TermMode::BRACKETED_PASTE)
+        };
+        let needs_confirm =
+            needs_multiline_confirm(bracketed, &text, self.config.paste.confirm_multiline);
+        if needs_confirm {
+            self.ask_paste_confirm(window, text, bracketed, cx);
+            return;
+        }
+        self.send_paste(text, bracketed, cx);
+    }
+
     /// 键盘焦点移入这个标签的终端。
     pub fn focus_terminal(&self, window: &mut Window) {
         self.focus.focus(window);

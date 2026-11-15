@@ -65,6 +65,38 @@ pub mod tabbar {
     pub const CLOSE_ICON_HOVER_BG: u32 = 0x4a4a4a;
 }
 
+/// 应用工具栏配色。工具栏位于标签条与终端内容之间,底色比终端亮一档,
+/// 与标签条同属"窗口装饰"层,视觉上连成一片。
+pub mod toolbar {
+    /// 工具栏底色。
+    pub const BG: u32 = 0x242424;
+    /// 工具栏下边线(分隔工具栏与终端内容)。
+    pub const BORDER: u32 = 0x333333;
+    /// 可用按钮的图标颜色。
+    pub const ICON: u32 = 0xc0c0c0;
+    /// 可用按钮悬停时的底色。
+    pub const HOVER_BG: u32 = 0x3a3a3a;
+    /// 尚未实现功能的按钮图标颜色(置灰,提示不可用)。
+    pub const ICON_DISABLED: u32 = 0x606060;
+    /// 工具栏按钮的提示文字颜色。
+    pub const LABEL: u32 = 0xc8c8c8;
+}
+
+/// 应用工具栏高度(px)。不计入终端网格行数,但会占用客户区高度(WIN-007)。
+pub const TOOLBAR_HEIGHT: f32 = 34.0;
+
+/// 工具栏按钮高度(px)。
+pub const TOOLBAR_BUTTON_HEIGHT: f32 = 26.0;
+
+/// 工具栏按钮图标尺寸(px)。
+pub const TOOLBAR_ICON_SIZE: f32 = 16.0;
+
+/// 工具栏按钮的横向内边距(px)。
+pub const TOOLBAR_BUTTON_PADDING: f32 = 8.0;
+
+/// 工具栏按钮之间的间隔(px)。
+pub const TOOLBAR_BUTTON_GAP: f32 = 4.0;
+
 /// 「新建标签」按钮的宽度(px)。
 pub const NEW_TAB_BUTTON_WIDTH: f32 = 30.0;
 

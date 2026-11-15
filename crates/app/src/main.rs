@@ -9,13 +9,13 @@ use gpui::{
     WindowDecorations, WindowOptions,
 };
 
-use term_ui::actions::{CloseActiveTab, NewTab, NextTab, PrevTab};
+use term_ui::actions::{CloseActiveTab, CopySelection, NewTab, NextTab, PasteClipboard, PrevTab};
 use term_ui::tabs::TabsView;
 
 const INIT_COLS: u16 = 80;
 const INIT_ROWS: u16 = 24;
 
-/// 注册标签页快捷键(KEY-006..KEY-009)。
+/// 注册标签页与复制/粘贴快捷键(KEY-001、KEY-002、KEY-006..KEY-009)。
 ///
 /// 为什么用 `Ctrl+Shift` 而不是裸 `Ctrl+T` / `Ctrl+W`:
 /// gpui 的绑定在 `on_key_down` **之前**匹配(见 gpui 0.2.2 `window.rs:3790` 的
@@ -29,6 +29,9 @@ fn bind_tab_keys(cx: &mut App) {
         KeyBinding::new("ctrl-shift-w", CloseActiveTab, Some("TabsRoot")),
         KeyBinding::new("ctrl-tab", NextTab, Some("TabsRoot")),
         KeyBinding::new("ctrl-shift-tab", PrevTab, Some("TabsRoot")),
+        // KEY-001/KEY-002:复制与剪贴板粘贴。与工具栏按钮走同一批 Action。
+        KeyBinding::new("ctrl-shift-c", CopySelection, Some("TabsRoot")),
+        KeyBinding::new("ctrl-shift-v", PasteClipboard, Some("TabsRoot")),
     ]);
 }
 

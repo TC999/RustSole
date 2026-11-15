@@ -22,13 +22,22 @@ use gpui::{
     MouseButton, MouseDownEvent, MouseMoveEvent, Pixels, Point, Render, SharedString, Window,
 };
 
-use crate::actions::{CloseActiveTab, NewTab, NextTab, PrevTab};
+use crate::actions::{CloseActiveTab, CopySelection, NewTab, NextTab, PasteClipboard, PrevTab};
 use crate::tabbar::{
     render_tabbar, CloseHover, TabDoubleClickHandler, TabHit, TabItem, TabbarHandlers,
 };
-use crate::theme::{window as window_theme, WindowControl, WindowControlsShown, TITLEBAR_HEIGHT};
+use crate::theme::{
+    window as window_theme, WindowControl, WindowControlsShown, TITLEBAR_HEIGHT, TOOLBAR_HEIGHT,
+};
 use crate::titlebar::{render_titlebar, TitlebarHandlers, TitlebarModel};
+use crate::toolbar::{render_toolbar, ToolbarButton, ToolbarHandlers, ToolbarItem};
 use crate::view::{TerminalEvent, TerminalView, DEFAULT_TAB_TITLE};
+
+/// 终端内容区上方被 chrome 占用的高度(标题栏 + 工具栏)。
+///
+/// 终端网格行数按「客户区高度 - chrome_height」计算(WIN-007):
+/// 标签条与工具栏都不占网格行,否则 `stty size` 的行数会与可见行数不符。
+const CHROME_HEIGHT: f32 = TITLEBAR_HEIGHT + TOOLBAR_HEIGHT;
 
 /// 判定"用户想拖动窗口"的位移阈值(逻辑像素)。
 ///
@@ -48,6 +57,8 @@ pub struct TabsView {
     hovered_control: Option<WindowControl>,
     /// 当前悬停的标签关闭图标(标签下标)。None = 没有悬停在任何关闭图标上。
     hovered_close: Option<usize>,
+    /// 当前悬停的工具栏按钮。None = 没有悬停在任何工具栏按钮上。
+    hovered_toolbar: Option<ToolbarButton>,
     /// 在标签条空白处按下左键时的坐标(视口坐标)。
     ///
     /// 只是"可能的拖动起点":位移超过阈值才真正发起窗口拖动。
@@ -87,6 +98,7 @@ impl TabsView {
                 hovered_tab: None,
                 hovered_control: None,
                 hovered_close: None,
+                hovered_toolbar: None,
                 drag_pending: None,
                 init_cols: cols,
                 init_rows: rows,
@@ -236,6 +248,77 @@ impl TabsView {
             })
             .collect()
     }
+
+    /// 工具栏的呈现数据。
+    ///
+    /// 只有「新建标签页」「复制」「粘贴」在本阶段可用;「拆分视图」「查找」依赖尚未
+    /// 实现的功能(阶段 3/4),置灰且不响应点击。
+    fn toolbar_items(&self) -> Vec<ToolbarItem> {
+        [
+            ToolbarButton::NewTab,
+            ToolbarButton::SplitView,
+            ToolbarButton::Copy,
+            ToolbarButton::Paste,
+            ToolbarButton::Find,
+        ]
+        .into_iter()
+        .map(|kind| ToolbarItem {
+            kind,
+            enabled: toolbar_button_enabled(kind),
+            hovered: self.hovered_toolbar == Some(kind),
+        })
+        .collect()
+    }
+
+    /// 执行工具栏按钮的动作。
+    ///
+    /// 只处理已实现的功能;不可用按钮在 `toolbar.rs` 里就没有注册点击,
+    /// 这里再挡一次是防御性的,避免后续新增按钮时误触发。
+    fn activate_toolbar_button(
+        &mut self,
+        kind: &ToolbarButton,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
+        if !toolbar_button_enabled(*kind) {
+            return;
+        }
+        match kind {
+            ToolbarButton::NewTab => self.new_tab(cx),
+            ToolbarButton::Copy => self.copy_active(cx),
+            ToolbarButton::Paste => self.paste_active(window, cx),
+            // 其余按钮功能未实现,不应走到这里
+            ToolbarButton::SplitView | ToolbarButton::Find | ToolbarButton::More => {}
+        }
+    }
+
+    /// 把「复制」动作转发给激活标签。
+    fn copy_active(&mut self, cx: &mut Context<Self>) {
+        let Some(tab) = self.active_tab().cloned() else {
+            return;
+        };
+        tab.update(cx, |tab, cx| tab.copy_selection(cx));
+    }
+
+    /// 把「粘贴」动作转发给激活标签。
+    fn paste_active(&mut self, window: &mut Window, cx: &mut Context<Self>) {
+        let Some(tab) = self.active_tab().cloned() else {
+            return;
+        };
+        tab.update(cx, |tab, cx| tab.paste_clipboard(window, cx));
+    }
+}
+
+/// 某个工具栏按钮在本阶段是否可用。
+///
+/// 纯函数,便于单测:不可用的按钮必须同时满足"不响应点击"与"置灰显示"。
+/// 「拆分视图」依赖分屏(阶段 3)、「查找」依赖搜索栏(阶段 4),这两项尚无
+/// 对应的 BEHAVIOR_SPEC 条目,本阶段一律置灰。
+pub(crate) fn toolbar_button_enabled(kind: ToolbarButton) -> bool {
+    matches!(
+        kind,
+        ToolbarButton::NewTab | ToolbarButton::Copy | ToolbarButton::Paste
+    )
 }
 
 /// 关闭标签后的窗口处理:最后一个标签关闭时关闭整个窗口。
@@ -454,6 +537,32 @@ impl Render for TabsView {
             },
         );
 
+        // 窗口客户区的实测尺寸:菜单定位要用它做边界钳制,根节点宽高也要用。
+        let layout = crate::view::layout_size(window);
+
+        // 工具栏:位于标签条与终端内容之间。
+        //
+        // 悬停高亮由视图持有:按钮只上报悬停事件,统一在这里更新,
+        // 再通过下一次渲染把高亮画出来(与标签条、窗口按钮同一套机制)。
+        let toolbar = {
+            let items = self.toolbar_items();
+            let click = Rc::new(cx.listener(|view, kind: &ToolbarButton, window, cx| {
+                view.activate_toolbar_button(kind, window, cx);
+            }));
+            let hover = Rc::new(cx.listener(
+                |view, hovered: &Option<ToolbarButton>, _window, cx| {
+                    if view.hovered_toolbar != *hovered {
+                        view.hovered_toolbar = *hovered;
+                        cx.notify();
+                    }
+                },
+            ));
+            render_toolbar(&items, ToolbarHandlers { click, hover }).into_any_element()
+        };
+
+        // 「更多」菜单:浮在窗口内容之上的弹出层。
+        //
+
         // 只渲染激活标签:隐藏的标签不需要布局与绘制,PTY 仍在后台运行。
         //
         // chrome 高度在渲染**之前**通过 defer 同步给激活标签:窗口尺寸变化时靠它
@@ -463,7 +572,7 @@ impl Render for TabsView {
             Some(tab) => {
                 let chrome = tab.clone();
                 cx.defer(move |cx| {
-                    chrome.update(cx, |tab, cx| tab.set_chrome_height(TITLEBAR_HEIGHT, cx));
+                    chrome.update(cx, |tab, cx| tab.set_chrome_height(CHROME_HEIGHT, cx));
                 });
                 tab.into_any_element()
             }
@@ -474,7 +583,6 @@ impl Render for TabsView {
         // 设置宽高,不能用 size_full():窗口「最大化 -> 最小化 -> 还原」后 gpui 的
         // viewport_size 可能仍停留在最大化时的大小,按它排布会把整组窗口按钮推到窗口外
         // (用户实测:三个按钮消失,点别的窗口才恢复)。终端内容区用的是同一套校正值。
-        let layout = crate::view::layout_size(window);
 
         div()
             .id("tabs-root")
@@ -485,12 +593,21 @@ impl Render for TabsView {
             }))
             .on_action(cx.listener(|view, _: &NextTab, window, cx| view.next_tab(window, cx)))
             .on_action(cx.listener(|view, _: &PrevTab, window, cx| view.prev_tab(window, cx)))
+            // KEY-001/KEY-002:工具栏的「复制」「粘贴」与快捷键走同一条路径。
+            .on_action(cx.listener(|view, _: &CopySelection, _window, cx| view.copy_active(cx)))
+            .on_action(
+                cx.listener(|view, _: &PasteClipboard, window, cx| view.paste_active(window, cx)),
+            )
             .flex()
             .flex_col()
+            // relative:菜单浮层用绝对定位落在根节点(窗口原点)下,
+            // 定位基准才与点击坐标一致。
+            .relative()
             .w(px(layout.0))
             .h(px(layout.1))
             .bg(rgb(window_theme::WINDOW_BG))
             .child(titlebar)
+            .child(toolbar)
             // 新建标签失败等可恢复错误显示在界面底部,不打断使用
             .children(status.map(|text| {
                 div()
@@ -510,6 +627,9 @@ impl Render for TabsView {
 
 #[cfg(test)]
 mod tests {
+    use super::*;
+    use crate::theme::TOOLBAR_HEIGHT;
+
     /// 测试用最小状态:只保留下标运算需要的那部分视图状态。
     ///
     /// 真实视图需要 GPUI 上下文与 PTY,这些行为由手工验收覆盖;
@@ -598,6 +718,33 @@ mod tests {
         assert_eq!(s.active, 0, "最后一个的下一个应是第一个");
         s.prev();
         assert_eq!(s.active, 2, "第一个的上一个应是最后一个");
+    }
+
+    /// 工具栏:已实现功能的按钮可用,未实现的一律置灰。
+    ///
+    /// 「拆分视图」依赖分屏(阶段 3)、「查找」依赖搜索栏(阶段 4),这两项在本阶段不可用。
+    #[test]
+    fn toolbar_buttons_enabled_matches_implemented_features() {
+        assert!(toolbar_button_enabled(ToolbarButton::NewTab));
+        assert!(toolbar_button_enabled(ToolbarButton::Copy));
+        assert!(toolbar_button_enabled(ToolbarButton::Paste));
+
+        assert!(!toolbar_button_enabled(ToolbarButton::SplitView));
+        assert!(!toolbar_button_enabled(ToolbarButton::Find));
+    }
+
+    /// WIN-007:标题栏与工具栏都不占终端网格行,网格高度按客户区减去两者计算。
+    #[test]
+    fn chrome_height_covers_titlebar_and_toolbar() {
+        // 通过函数读取,避免被当作编译期常量断言(clippy::assertions_on_constants)。
+        fn chrome_height() -> f32 {
+            CHROME_HEIGHT
+        }
+        assert_eq!(chrome_height(), TITLEBAR_HEIGHT + TOOLBAR_HEIGHT);
+        assert!(
+            chrome_height() > TITLEBAR_HEIGHT,
+            "工具栏额外占用了一行高度"
+        );
     }
 
     /// 只有一个标签时切换是空操作(不应改变激活下标或崩溃)
