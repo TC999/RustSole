@@ -25,6 +25,10 @@ use alacritty_terminal::term::TermMode;
 
 use term_config::Config;
 use term_core::key::{encode_key, KeyState};
+use term_core::mouse::{
+    alternate_scroll_sequence, encode_mouse_report, encode_wheel_report, MouseAction,
+    MouseButton as ReportButton, MouseReport, WheelDirection,
+};
 use term_core::paste::{needs_multiline_confirm, sanitize_paste};
 use term_core::proxy::TermEventMsg;
 use term_core::selection::{trim_selection_text, word_span, SelectionBuffer};
@@ -32,7 +36,7 @@ use term_core::session::Session;
 
 use crate::buffer;
 use crate::grid::{ratio_to_offset, snapshot, thumb_ratio, GridSnapshot};
-use crate::selection::{terminal_handles_mouse, DragAnchor, GridGeometry};
+use crate::selection::{DragAnchor, GridGeometry};
 use crate::theme::{terminal, window as window_theme, WindowControl};
 
 /// 标签的默认标题:程序未通过 OSC 0/2 设置标题时显示。
@@ -289,7 +293,60 @@ impl TerminalView {
             return;
         }
         self.scroll_remainder -= whole;
-        self.scroll_lines(whole as i32, cx);
+        let lines_i = whole as i32;
+        let mode = {
+            let term = self.session.term.lock();
+            *term.mode()
+        };
+
+        // MOUSE-001:程序接管鼠标时滚轮上报给程序(Shift 旁路仍回终端,MOUSE-002)
+        if mode.intersects(TermMode::MOUSE_MODE) && !event.modifiers.shift {
+            self.report_wheel(mode, lines_i, event, cx);
+            return;
+        }
+        // MOUSE-003:备用屏且程序开启 ALTERNATE_SCROLL → 方向键序列(Shift 回看历史)
+        if !event.modifiers.shift {
+            if let Some(seq) =
+                alternate_scroll_sequence(mode, wheel_direction(lines_i), lines_i.unsigned_abs())
+            {
+                self.session.write(&seq);
+                cx.notify();
+                return;
+            }
+        }
+        // 主屏(或备用屏未开启 ALTERNATE_SCROLL):终端回看历史
+        self.scroll_lines(lines_i, cx);
+    }
+
+    /// 滚轮上报:每整行一帧(协议按行计数,与键盘滚轮的行语义一致)。
+    /// 滚轮位置取当前指针所在单元格;几何无效时静默丢弃。
+    fn report_wheel(
+        &mut self,
+        mode: TermMode,
+        lines: i32,
+        event: &ScrollWheelEvent,
+        cx: &mut Context<Self>,
+    ) {
+        let Some(anchor) = self.cell_from_position(event.position) else {
+            return;
+        };
+        let direction = wheel_direction(lines);
+        let report = MouseReport {
+            line: anchor.line,
+            col: anchor.col,
+            side_left: anchor.side_left,
+            shift: event.modifiers.shift,
+            alt: event.modifiers.alt,
+            control: event.modifiers.control,
+        };
+        // 每行一帧;上限防御:单次事件钳到 64 行,与 alternate_scroll_sequence 一致
+        let frames = lines.unsigned_abs().min(64);
+        for _ in 0..frames {
+            if let Some(bytes) = encode_wheel_report(mode, direction, report) {
+                self.session.write(&bytes);
+            }
+        }
+        cx.notify();
     }
 
     /// 滚动条按下:命中 thumb 区域时开始拖动,否则跳转到点击位置。
@@ -632,14 +689,17 @@ impl TerminalView {
         self.keyboard_anchor = None;
         self.keyboard_focus = None;
 
-        // MOUSE-001/002:程序接管鼠标时终端不抢事件;Shift 强制由终端处理
-        let mouse_reporting = {
+        // MOUSE-001/002:程序接管鼠标时事件上报给程序;Shift 强制由终端自己处理。
+        // 上报条件:程序接管且未按 Shift(MOUSE-002)。
+        let mode = {
             let term = self.session.term.lock();
-            term.mode().intersects(TermMode::MOUSE_MODE)
+            *term.mode()
         };
-        if !terminal_handles_mouse(mouse_reporting, event.modifiers.shift) {
+        if mode.intersects(TermMode::MOUSE_MODE) && !event.modifiers.shift {
+            self.report_mouse(mode, action_of(event.button), event, cx);
             return;
         }
+        // 程序未接管,或 Shift 旁路(MOUSE-002):终端自己处理选区与中键粘贴
 
         match event.button {
             MouseButton::Left => {
@@ -651,6 +711,57 @@ impl TerminalView {
             }
             MouseButton::Middle => self.paste_selection_buffer(window, cx),
             _ => {}
+        }
+    }
+
+    /// 把一次按下/抬起/移动换算成单元格坐标并上报给程序(MOUSE-001)。
+    ///
+    /// 坐标换算失败(几何无效)或协议拒绝(历史行、坐标越界、不可表达)时静默丢弃:
+    /// 上报是尽力而为,失败不应升级为 UI 错误。
+    fn report_mouse(
+        &mut self,
+        mode: TermMode,
+        action: MouseAction,
+        event: &MouseDownEvent,
+        cx: &mut Context<Self>,
+    ) {
+        let Some(anchor) = self.cell_from_position(event.position) else {
+            return;
+        };
+        self.send_mouse_report(
+            mode,
+            action,
+            anchor,
+            event.modifiers.shift,
+            event.modifiers.alt,
+            event.modifiers.control,
+            cx,
+        );
+    }
+
+    /// 组装上报结构并写入 PTY;编码结果为 None 时静默丢弃(见 `report_mouse`)。
+    #[allow(clippy::too_many_arguments)]
+    fn send_mouse_report(
+        &mut self,
+        mode: TermMode,
+        action: MouseAction,
+        anchor: DragAnchor,
+        shift: bool,
+        alt: bool,
+        control: bool,
+        cx: &mut Context<Self>,
+    ) {
+        let report = MouseReport {
+            line: anchor.line,
+            col: anchor.col,
+            side_left: anchor.side_left,
+            shift,
+            alt,
+            control,
+        };
+        if let Some(bytes) = encode_mouse_report(mode, action, report) {
+            self.session.write(&bytes);
+            cx.notify();
         }
     }
 
@@ -706,7 +817,36 @@ impl TerminalView {
     }
 
     /// 鼠标移动:拖动中把选区末端移到当前单元格;到边缘时自动滚动并持续扩展(SEL-013)。
+    /// 程序接管鼠标时改为上报移动(MOUSE-001):按住为 Drag(tmux 拖选),
+    /// 无按键为 Motion(vim 可视模式悬停),模式位不足则不上报。
     fn handle_mouse_move(&mut self, event: &MouseMoveEvent, cx: &mut Context<Self>) {
+        let mode = {
+            let term = self.session.term.lock();
+            *term.mode()
+        };
+        // 上报条件:程序接管且未按 Shift(Shift = MOUSE-002,终端自己处理选区)
+        let reporting = mode.intersects(TermMode::MOUSE_MODE);
+        if reporting && !event.modifiers.shift {
+            let action = match event.pressed_button {
+                Some(MouseButton::Left) => MouseAction::Drag(ReportButton::Left),
+                Some(MouseButton::Middle) => MouseAction::Drag(ReportButton::Middle),
+                Some(MouseButton::Right) => MouseAction::Drag(ReportButton::Right),
+                // Navigate 等无法映射的按键:按无按键移动处理,由模式位决定是否上报
+                _ => MouseAction::Motion,
+            };
+            if let Some(anchor) = self.cell_from_position(event.position) {
+                self.send_mouse_report(
+                    mode,
+                    action,
+                    anchor,
+                    event.modifiers.shift,
+                    event.modifiers.alt,
+                    event.modifiers.control,
+                    cx,
+                );
+            }
+            return;
+        }
         if self.drag_anchor.is_none() {
             return;
         }
@@ -843,8 +983,38 @@ impl TerminalView {
         self.commit_selection(cx);
     }
 
-    /// 鼠标抬起:左键抬起时把选中文本写入选区缓冲(SEL-001)。
+    /// 鼠标抬起:左键抬起时把选中文本写入选区缓冲(SEL-001);
+    /// 程序接管鼠标时改为上报释放帧(MOUSE-001)。
     fn handle_mouse_up(&mut self, event: &MouseUpEvent, cx: &mut Context<Self>) {
+        // MOUSE-001:程序接管鼠标(且非 Shift 旁路,MOUSE-002)时释放帧归程序。
+        // 上报模式下 drag_anchor 不会被置位,这里按模式分流,不走选区提交。
+        let mode = {
+            let term = self.session.term.lock();
+            *term.mode()
+        };
+        // 上报条件:程序接管且未按 Shift(Shift = MOUSE-002,终端自己处理选区)
+        let reporting = mode.intersects(TermMode::MOUSE_MODE);
+        if reporting && !event.modifiers.shift {
+            if let Some(anchor) = self.cell_from_position(event.position) {
+                let button = match event.button {
+                    MouseButton::Left => ReportButton::Left,
+                    MouseButton::Middle => ReportButton::Middle,
+                    MouseButton::Right => ReportButton::Right,
+                    // 协议只定义左/中/右;导航键不上报(alacritty 同样直接 return)
+                    MouseButton::Navigate(_) => return,
+                };
+                self.send_mouse_report(
+                    mode,
+                    MouseAction::Release(button),
+                    anchor,
+                    event.modifiers.shift,
+                    event.modifiers.alt,
+                    event.modifiers.control,
+                    cx,
+                );
+            }
+            return;
+        }
         if event.button != MouseButton::Left || self.drag_anchor.take().is_none() {
             return;
         }
@@ -1078,6 +1248,26 @@ impl TerminalView {
         let payload = sanitize_paste(&text, bracketed);
         self.session.write(payload.as_bytes());
         cx.notify();
+    }
+}
+
+/// gpui 按键 → 上报按键枚举(按下帧用)。协议只定义左/中/右,
+/// Navigate(前进/后退)无法表达,折算成 Motion 由 encode 层按模式位丢弃。
+fn action_of(button: MouseButton) -> MouseAction {
+    match button {
+        MouseButton::Left => MouseAction::Press(ReportButton::Left),
+        MouseButton::Middle => MouseAction::Press(ReportButton::Middle),
+        MouseButton::Right => MouseAction::Press(ReportButton::Right),
+        MouseButton::Navigate(_) => MouseAction::Motion,
+    }
+}
+
+/// 滚轮行数符号 → 方向(向上滚为正,见 handle_scroll_wheel 的符号依据)。
+fn wheel_direction(lines: i32) -> WheelDirection {
+    if lines > 0 {
+        WheelDirection::Up
+    } else {
+        WheelDirection::Down
     }
 }
 
