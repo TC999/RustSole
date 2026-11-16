@@ -53,6 +53,24 @@ pub const CELL_WIDTH: f32 = 8.0;
 pub const CELL_HEIGHT: f32 = 16.0;
 pub const FONT_SIZE: f32 = 14.0;
 
+/// 终端内容区左右两侧各留的间隙,以"半个单元格宽"为单位(RENDER-001)。
+///
+/// 半个半角空格 = cell_width / 2;用格数而非固定 px 表达,
+/// 字体测量变化时间隙与文字仍保持同比例。
+pub const TERMINAL_INSET_CELLS: f32 = 0.5;
+
+/// 按可用宽度(已扣除滚动条轨道)计算网格列数,左右各减去 [`TERMINAL_INSET_CELLS`] 格间隙。
+///
+/// 渲染内边距与列数计算必须用同一函数,否则画布间隙会挤掉最后一列(表现为列数抖动)。
+/// `cell_width` 非正数(仅发生在首次测量前)时返回 2,由 alacritty 的 MIN_COLUMNS 兜底。
+pub fn columns_for_width(width: f32, cell_width: f32) -> u16 {
+    if cell_width <= 0.0 {
+        return 2;
+    }
+    let usable = (width - 2.0 * TERMINAL_INSET_CELLS * cell_width).max(0.0);
+    ((usable / cell_width).floor() as u16).max(2)
+}
+
 /// 滚动条轨道宽度(px)。
 pub const SCROLLBAR_WIDTH: f32 = 10.0;
 
@@ -388,14 +406,15 @@ impl TerminalView {
         if w > 0.0 {
             self.cell_width = w;
             // 列宽变了,重新按新宽度计算网格尺寸并同步 PTY。
-            // 算法必须与 sync_size 保持一致(同样扣掉滚动条轨道宽度),否则首次测量后
-            // 会先按整幅宽度算出偏多的列数,下一帧再被 sync_size 改回来,窗口一开就抖动。
+            // 算法必须与 sync_size 保持一致(同样用 columns_for_width 扣掉滚动条轨道
+            // 与左右半格间隙),否则首次测量后会先按整幅宽度算出偏多的列数,
+            // 下一帧再被 sync_size 改回来,窗口一开就抖动。
             let viewport = window.viewport_size();
             let width: f32 = viewport.width.into();
             // 行数按扣掉 chrome 之后的可用高度算,与 sync_size 保持一致
             let height = (f32::from(viewport.height) - self.chrome_height).max(0.0);
             self.rows = ((height / CELL_HEIGHT).floor() as u16).max(1);
-            self.cols = (((width - SCROLLBAR_WIDTH) / w).floor() as u16).max(2);
+            self.cols = columns_for_width(width - SCROLLBAR_WIDTH, w);
             self.session.resize(self.cols, self.rows);
             {
                 let mut term = self.session.term.lock();
@@ -467,9 +486,10 @@ impl TerminalView {
         // 客户区高度里扣掉标签栏等 chrome:终端网格只占其下方区域(WIN-007)。
         // 若不扣,最后一行会被 chrome 遮住,且 stty size 比可见行数多。
         let height: f32 = (height - self.chrome_height).max(0.0);
-        // 扣掉滚动条轨道宽度(列数按终端画布实际可用宽度算)
+        // 扣掉滚动条轨道宽度与左右半格间隙(列数按终端画布实际可用宽度算,
+        // 与 render 中的 pl/pr 内边距共用 columns_for_width,保持一致)
         // alacritty 限制:MIN_COLUMNS=2,可见行至少 1
-        let new_cols = (((width - SCROLLBAR_WIDTH) / self.cell_width).floor() as u16).max(2);
+        let new_cols = columns_for_width(width - SCROLLBAR_WIDTH, self.cell_width);
         let new_rows = ((height / CELL_HEIGHT).floor() as u16).max(1);
         // 滚动条几何(点击跳转/拖动)要用终端内容区的实际高度;这里就是它的来源。
         // 此前该字段只初始化、从未赋值,导致轨道高度恒为 0,滚动条点击位置判断失效。
@@ -1253,30 +1273,39 @@ impl Render for TerminalView {
                     .child(
                         // 画布占据滚动条以外的宽度:`flex_1` 而不是 `size_full`,
                         // 否则 canvas 会按整行宽度布局,把滚动条挤出可视区。
-                        div().flex_1().h_full().child(
-                            canvas(
-                                move |bounds, _window, _cx| {
-                                    // 画布原点供鼠标坐标换算:视图字段在绘制闭包里拿不到
-                                    // 可变引用,走共享 Cell 回填。
-                                    (f32::from(bounds.origin.x), f32::from(bounds.origin.y))
-                                },
-                                move |bounds, origin, window, cx| {
-                                    canvas_origin.set(origin);
-                                    // 注册 IME 输入处理器(paint 阶段必须;焦点在终端时平台才会投递组合文本)
-                                    window.handle_input(
-                                        &focus,
-                                        ElementInputHandler::new(bounds, this.clone()),
-                                        cx,
-                                    );
-                                    paint_grid(&snapshot, cell_width, bounds, window, cx);
-                                    // 选区与中键粘贴用窗口级监听:按下后指针离开画布
-                                    // (gpui 在按下时已 SetCapture)仍要收到移动与抬起,
-                                    // 元素级 on_mouse_move 的 is_hovered 过滤会漏掉这些事件。
-                                    register_mouse_handlers(window, bounds, this.clone());
-                                },
-                            )
-                            .size_full(),
-                        ),
+                        // 左右各留半格间隙(RENDER-001):padding 使 canvas 的 bounds
+                        // 原点自动右移,鼠标坐标换算/选区/IME 候选窗都经 canvas_origin
+                        // 或 bounds 取坐标,无需额外适配。列数计算在 columns_for_width
+                        // 中同步扣掉这两段间隙,保证最后一列不被 padding 挤出画布。
+                        div()
+                            .flex_1()
+                            .h_full()
+                            .pl(px(TERMINAL_INSET_CELLS * cell_width))
+                            .pr(px(TERMINAL_INSET_CELLS * cell_width))
+                            .child(
+                                canvas(
+                                    move |bounds, _window, _cx| {
+                                        // 画布原点供鼠标坐标换算:视图字段在绘制闭包里拿不到
+                                        // 可变引用,走共享 Cell 回填。
+                                        (f32::from(bounds.origin.x), f32::from(bounds.origin.y))
+                                    },
+                                    move |bounds, origin, window, cx| {
+                                        canvas_origin.set(origin);
+                                        // 注册 IME 输入处理器(paint 阶段必须;焦点在终端时平台才会投递组合文本)
+                                        window.handle_input(
+                                            &focus,
+                                            ElementInputHandler::new(bounds, this.clone()),
+                                            cx,
+                                        );
+                                        paint_grid(&snapshot, cell_width, bounds, window, cx);
+                                        // 选区与中键粘贴用窗口级监听:按下后指针离开画布
+                                        // (gpui 在按下时已 SetCapture)仍要收到移动与抬起,
+                                        // 元素级 on_mouse_move 的 is_hovered 过滤会漏掉这些事件。
+                                        register_mouse_handlers(window, bounds, this.clone());
+                                    },
+                                )
+                                .size_full(),
+                            ),
                     )
                     .child(scrollbar_element(
                         self.scrollbar_ratio,
@@ -1541,5 +1570,40 @@ impl EntityInputHandler for TerminalView {
         _cx: &mut Context<Self>,
     ) -> Option<usize> {
         None
+    }
+}
+
+#[cfg(test)]
+mod inset_tests {
+    use super::*;
+
+    /// RENDER-001:列数按扣除左右半格间隙后的宽度计算
+    #[test]
+    fn render_001_columns_exclude_half_cell_insets_on_both_sides() {
+        // 10 格宽度,左右各 0.5 格:可用 9 格 → 9 列
+        assert_eq!(columns_for_width(10.0 * 8.0, 8.0), 9);
+        // 9.9 格宽度:可用 8.9 格 → 向下取整 8 列
+        assert_eq!(columns_for_width(9.9 * 8.0, 8.0), 8);
+    }
+
+    /// RENDER-001:间隙跟随实测列宽,不是固定 px
+    #[test]
+    fn render_001_inset_scales_with_cell_width() {
+        // 列宽 10px 时每侧间隙 5px:10 格宽度扣除 1 格 → 9 列
+        assert_eq!(columns_for_width(10.0 * 10.0, 10.0), 9);
+    }
+
+    /// 极窄窗口:可用宽度不足一格时至少保留 2 列(alacritty MIN_COLUMNS)
+    #[test]
+    fn clamps_to_minimum_columns() {
+        assert_eq!(columns_for_width(0.0, 8.0), 2);
+        assert_eq!(columns_for_width(4.0, 8.0), 2);
+    }
+
+    /// 首次测量前 cell_width 尚无有效值:不出错,按最小列数兜底
+    #[test]
+    fn tolerates_invalid_cell_width() {
+        assert_eq!(columns_for_width(800.0, 0.0), 2);
+        assert_eq!(columns_for_width(800.0, -1.0), 2);
     }
 }
