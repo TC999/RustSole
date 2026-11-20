@@ -22,8 +22,12 @@ use gpui::{
     MouseButton, MouseDownEvent, MouseMoveEvent, Pixels, Point, Render, SharedString, Window,
 };
 
-use crate::actions::{CloseActiveTab, CopySelection, NewTab, NextTab, PasteClipboard, PrevTab};
+use crate::actions::{
+    CloseActiveTab, ClosePane, CopySelection, FocusPaneDown, FocusPaneLeft, FocusPaneRight,
+    FocusPaneUp, NewTab, NextTab, PasteClipboard, PrevTab, SplitHorizontal, SplitVertical,
+};
 use crate::menu::{render_menu, MenuEntry, MenuHandlers, MenuHoverHandler, MenuItem, MenuItemId};
+use crate::panes::{PaneNode, SplitDirection, TerminalPaneTree};
 use crate::tabbar::{
     render_tabbar, CloseHover, TabDoubleClickHandler, TabHit, TabItem, TabbarHandlers,
 };
@@ -33,6 +37,12 @@ use crate::theme::{
 use crate::titlebar::{render_titlebar, TitlebarHandlers, TitlebarModel};
 use crate::toolbar::{render_toolbar, ToolbarButton, ToolbarHandlers, ToolbarItem};
 use crate::view::{TerminalEvent, TerminalView, DEFAULT_TAB_TITLE};
+
+/// 拆分分隔条宽度(px)(SPLIT-004)。
+///
+/// 画在 pane 之间的视觉边界,宽度计入 pane 区域但不属于任何一个 pane 的网格;
+/// 窗格列数按扣除它之后的宽度计算,与滚动条同一套做法。
+const SPLIT_DIVIDER_WIDTH: f32 = 2.0;
 
 /// 终端内容区上方被 chrome 占用的高度(标题栏 + 工具栏)。
 ///
@@ -48,8 +58,8 @@ const DRAG_THRESHOLD: f32 = 4.0;
 
 /// 标签页容器视图。
 pub struct TabsView {
-    /// 所有标签,顺序即标签条上的顺序。
-    tabs: Vec<Entity<TerminalView>>,
+    /// 所有标签,顺序即标签条上的顺序。每个标签内部是拆分窗格树(SPLIT-001)。
+    tabs: Vec<TerminalPaneTree>,
     /// 当前激活标签的下标。始终指向 `tabs` 内的有效元素(只要 tabs 非空)。
     active: usize,
     /// 标签条上悬停的标签(仅用于绘制悬停底色)。
@@ -98,7 +108,7 @@ impl TabsView {
                 cx.notify();
             });
             Self {
-                tabs: vec![first],
+                tabs: vec![PaneNode::leaf(first)],
                 active: 0,
                 hovered_tab: None,
                 hovered_control: None,
@@ -117,7 +127,8 @@ impl TabsView {
     }
 
     /// 当前激活标签。`None` 只在标签列表被清空后短暂出现(随即关闭窗口)。
-    pub fn active_tab(&self) -> Option<&Entity<TerminalView>> {
+    /// 激活标签的窗格树。
+    pub fn active_tab(&self) -> Option<&TerminalPaneTree> {
         self.tabs.get(self.active)
     }
 
@@ -133,10 +144,11 @@ impl TabsView {
     fn new_tab(&mut self, cx: &mut Context<Self>) {
         // 优先按当前激活标签的实际网格建新会话:窗口可能已被缩放,用启动常量会让
         // 新标签先按错误的行列启动、下一帧再 resize,子进程会看到两次窗口变化。
-        let (cols, rows) = match self.tabs.get(self.active) {
-            Some(tab) => {
-                let tab = tab.read(cx);
-                (tab.cols(), tab.rows())
+        // 拆分后的标签取 0 号窗格:新标签从单窗格开始,首窗格尺寸最接近其初始布局。
+        let (cols, rows) = match self.tabs.get(self.active).and_then(|tree| tree.leaf_at(0)) {
+            Some(pane) => {
+                let pane = pane.read(cx);
+                (pane.cols(), pane.rows())
             }
             None => (self.init_cols, self.init_rows),
         };
@@ -156,7 +168,8 @@ impl TabsView {
         let subscription = cx.subscribe(&tab, |_view, _tab, _event: &TerminalEvent, cx| {
             cx.notify();
         });
-        self.tabs.push(tab);
+        // 新标签从单窗格开始(SPLIT-001:拆分在标签内部进行)
+        self.tabs.push(PaneNode::leaf(tab));
         self.title_subscriptions.push(subscription);
         self.active = self.tabs.len() - 1;
         self.status = None;
@@ -209,10 +222,12 @@ impl TabsView {
     }
 
     /// 把键盘焦点交给激活标签的终端,并让它刷新一次画面。
+    ///
+    /// 拆分标签回到 0 号窗格(阅读序的第一个):切换标签是"重进这个标签"的
+    /// 语义,不记住上次在标签内的窗格位置;窗格内的移动用 SPLIT-006 的方向键。
     fn focus_active(&self, window: &mut Window, cx: &mut App) {
-        if let Some(tab) = self.tabs.get(self.active) {
-            let tab = tab.clone();
-            tab.update(cx, |tab, cx| {
+        if let Some(pane) = self.tabs.get(self.active).and_then(|tree| tree.leaf_at(0)) {
+            pane.update(cx, |tab, cx| {
                 tab.focus_terminal(window);
                 tab.refresh_on_activate(cx);
             });
@@ -244,12 +259,21 @@ impl TabsView {
         self.tabs
             .iter()
             .enumerate()
-            .map(|(index, tab)| {
-                let tab = tab.read(cx);
+            .map(|(index, tree)| {
+                // 标签标题取第一个窗格(TAB-008):拆分后各窗格有自己的 OSC 标题,
+                // 标签条展示首个窗格的;单独显示每个窗格标题属于后续增强。
+                let title = tree
+                    .leaf_at(0)
+                    .map(|view| view.read(cx).title())
+                    .unwrap_or_else(|| SharedString::from(DEFAULT_TAB_TITLE));
+                let exited = tree
+                    .leaf_at(0)
+                    .map(|view| view.read(cx).exited())
+                    .unwrap_or(false);
                 TabItem {
-                    title: tab.title(),
+                    title,
                     active: index == self.active,
-                    exited: tab.exited(),
+                    exited,
                     close_hovered: self.hovered_close == Some(index),
                 }
             })
@@ -258,8 +282,8 @@ impl TabsView {
 
     /// 工具栏的呈现数据。
     ///
-    /// 只有「新建标签页」「复制」「粘贴」在本阶段可用;「拆分视图」「查找」依赖尚未
-    /// 实现的功能(阶段 3/4),置灰且不响应点击。「更多」菜单在本阶段可用。
+    /// 「新建标签页」「拆分视图」「复制」「粘贴」可用(SPLIT-001:拆分接入工具栏);
+    /// 「查找」依赖尚未实现的功能(阶段 4),置灰且不响应点击。「更多」菜单可用。
     fn toolbar_items(&self) -> Vec<ToolbarItem> {
         [
             ToolbarButton::NewTab,
@@ -293,29 +317,47 @@ impl TabsView {
         }
         match kind {
             ToolbarButton::NewTab => self.new_tab(cx),
-            ToolbarButton::Copy => self.copy_active(cx),
+            // SPLIT-001:工具栏按钮与 Ctrl+Shift+E 走同一路径(垂直拆分)。
+            ToolbarButton::SplitView => self.split_pane(SplitDirection::Vertical, window, cx),
+            ToolbarButton::Copy => self.copy_active(window, cx),
             ToolbarButton::Paste => self.paste_active(window, cx),
             // 其余按钮功能未实现,不应走到这里
-            ToolbarButton::SplitView | ToolbarButton::Find => {}
+            ToolbarButton::Find => {}
             // 「更多」在工具栏层单独处理(需要点击位置作为菜单锚点)
             ToolbarButton::More => {}
         }
     }
 
-    /// 把「复制」动作转发给激活标签。
-    fn copy_active(&mut self, cx: &mut Context<Self>) {
-        let Some(tab) = self.active_tab().cloned() else {
-            return;
-        };
-        tab.update(cx, |tab, cx| tab.copy_selection(cx));
+    /// 把「复制」动作转发给焦点所在的窗格(SPLIT-006 推论)。
+    fn copy_active(&mut self, window: &mut Window, cx: &mut Context<Self>) {
+        self.with_focused_pane(window, cx, |tab, _window, cx| tab.copy_selection(cx));
     }
 
-    /// 把「粘贴」动作转发给激活标签。
+    /// 把「粘贴」动作转发给焦点所在的窗格(SPLIT-006 推论)。
     fn paste_active(&mut self, window: &mut Window, cx: &mut Context<Self>) {
-        let Some(tab) = self.active_tab().cloned() else {
+        self.with_focused_pane(window, cx, |tab, window, cx| {
+            tab.paste_clipboard(window, cx);
+        });
+    }
+
+    /// 对焦点所在的窗格执行一次操作;焦点不在任何窗格时退回 0 号。
+    ///
+    /// 所有"对当前终端的操作"(复制/粘贴/清历史/保存输出)共用这个入口:
+    /// 多窗格下用户看到键盘输入落在哪,操作就作用在哪。
+    /// 回调额外拿到 &mut Window:粘贴确认对话框等操作需要窗口上下文。
+    fn with_focused_pane(
+        &self,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+        f: impl FnOnce(&mut TerminalView, &mut Window, &mut gpui::Context<TerminalView>),
+    ) {
+        let Some(tree) = self.active_tab() else {
             return;
         };
-        tab.update(cx, |tab, cx| tab.paste_clipboard(window, cx));
+        let Some(pane) = tree.focused_or_first_leaf(window, cx) else {
+            return;
+        };
+        pane.update(cx, |tab, cx| f(tab, window, cx));
     }
 
     /// 切换「更多」菜单的展开状态。
@@ -348,22 +390,156 @@ impl TabsView {
     fn activate_menu_item(&mut self, id: &MenuItemId, cx: &mut Context<Self>) {
         self.close_menu(cx);
         match id {
-            // 清除回滚历史:交给激活标签执行(它才有 Term 的锁)。
+            // 清除回滚历史:交给焦点窗格执行(它才有 Term 的锁)。activate_menu_item
+            // 没有 window 参数,而这两项操作不需要窗口上下文;焦点判定在无 window
+            // 场景下退回 0 号窗格,与"菜单动作作用于最近使用的终端"一致。
             MenuItemId::ClearHistory => {
-                let Some(tab) = self.active_tab().cloned() else {
-                    return;
-                };
-                tab.update(cx, |tab, cx| tab.clear_history(cx));
+                self.with_active_pane(cx, |tab, cx| tab.clear_history(cx));
             }
             // 输出保存为:弹系统保存对话框,写文件在后台线程。
             MenuItemId::SaveOutputAs => {
-                let Some(tab) = self.active_tab().cloned() else {
-                    return;
-                };
-                tab.update(cx, |tab, cx| tab.save_output_as(cx));
+                self.with_active_pane(cx, |tab, cx| tab.save_output_as(cx));
             }
             // 其余菜单项本阶段没有可用功能,不应走到这里。
             _ => {}
+        }
+    }
+
+    /// 对激活标签的焦点窗格执行操作的无窗口版本(菜单路径专用)。
+    ///
+    /// 菜单回调只给 App 上下文,拿不到 Window;焦点判定退化为"0 号窗格"
+    /// 是可接受的近似:打开菜单前用户必然在某个终端上点击/输入,
+    /// 大多数场景下 0 号不是焦点窗格时用户会先用方向键把焦点挪过去。
+    fn with_active_pane(
+        &self,
+        cx: &mut Context<Self>,
+        f: impl FnOnce(&mut TerminalView, &mut gpui::Context<TerminalView>),
+    ) {
+        let Some(tree) = self.active_tab() else {
+            return;
+        };
+        let Some(pane) = tree.leaves().into_iter().next() else {
+            return;
+        };
+        pane.update(cx, f);
+    }
+
+    /// 当前焦点所在窗格的深度优先序下标(SPLIT-006)。
+    ///
+    /// 焦点不在激活标签的任何窗格上(启动后尚未点击/切换过)时,
+    /// 退回 0 号窗格,保证拆分动作总有落点。
+    fn focused_pane(&self, window: &Window, cx: &App) -> usize {
+        self.active_tab()
+            .and_then(|tree| tree.focused_leaf(window, cx))
+            .unwrap_or(0)
+    }
+
+    /// 把键盘焦点交给激活标签的第 index 个窗格(SPLIT-006)。
+    fn focus_pane(&self, index: usize, window: &mut Window, cx: &mut App) {
+        let Some(tree) = self.active_tab() else {
+            return;
+        };
+        let Some(view) = tree.leaf_at(index) else {
+            return;
+        };
+        view.update(cx, |view, cx| {
+            view.focus_terminal(window);
+            view.refresh_on_activate(cx);
+        });
+    }
+
+    /// 在焦点所在窗格上执行拆分(SPLIT-001)。
+    ///
+    /// 新窗格按当前窗格的网格尺寸启动,与 new_tab 同一考量:避免先按
+    /// 错误行列启动、下一帧再 resize 让子进程看到两次窗口变化。
+    /// 启动失败时状态栏提示,不拆分(现有窗格保持可用)。
+    fn split_pane(
+        &mut self,
+        direction: SplitDirection,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
+        let Some(tree) = self.active_tab() else {
+            return;
+        };
+        // 尺寸按当前窗格取:两个窗格的网格尺寸只在拆分瞬间暂时相同,
+        // 之后各自独立变化,新建会话用焦点窗格的尺寸最贴近用户预期。
+        let pane = match tree.leaf_at(self.focused_pane(window, cx)) {
+            Some(pane) => pane,
+            None => return,
+        };
+        let (cols, rows) = {
+            let pane = pane.read(cx);
+            (pane.cols(), pane.rows())
+        };
+        let created = TerminalView::new(cx, cols, rows, TITLEBAR_HEIGHT);
+        let new_view = match created {
+            Ok(view) => view,
+            Err(err) => {
+                // 与 new_tab 同策略:用户可恢复错误显示在状态栏,不动现有窗格
+                self.status = Some(SharedString::from(format!("拆分窗格失败: {err}")));
+                cx.notify();
+                return;
+            }
+        };
+        let subscription = cx.subscribe(&new_view, |_view, _tab, _event: &TerminalEvent, cx| {
+            cx.notify();
+        });
+        self.title_subscriptions.push(subscription);
+        let Some(old_tree) = self.tabs.get_mut(self.active) else {
+            return;
+        };
+        let old = std::mem::replace(old_tree, PaneNode::leaf(new_view.clone()));
+        *old_tree = old.split(direction, new_view.clone());
+        // 焦点交给新窗格,与新建标签行为一致(用户拆分后直接可以输入)
+        let index = old_tree.leaf_count() - 1;
+        self.focus_pane(index, window, cx);
+        self.status = None;
+        cx.notify();
+    }
+
+    /// 关闭焦点所在的窗格(SPLIT-002)。
+    ///
+    /// 标签只剩一个窗格时等价于关闭标签,复用 TAB-005/007 的激活与关窗规则。
+    fn close_pane(&mut self, window: &mut Window, cx: &mut Context<Self>) {
+        let index = self.focused_pane(window, cx);
+        let Some(old_tree) = self.tabs.get(self.active) else {
+            return;
+        };
+        match old_tree.clone().close_leaf(index) {
+            // 还有别的窗格:树收缩,焦点交给被关闭窗格的兄弟(close_leaf 已返回)
+            Some((sibling, new_tree)) => {
+                let sibling_index = new_tree
+                    .leaves()
+                    .iter()
+                    .position(|view| view == &sibling)
+                    .unwrap_or(0);
+                self.tabs[self.active] = new_tree;
+                self.focus_pane(sibling_index, window, cx);
+                cx.notify();
+            }
+            // 最后一个窗格:关闭整个标签(内部再级联关窗)
+            None => self.close_tab_or_window(self.active, window, cx),
+        }
+    }
+
+    /// 焦点沿方向移动到相邻窗格(SPLIT-006)。
+    ///
+    /// 没有相邻窗格(边界)时保持焦点不变。
+    fn move_pane_focus(
+        &mut self,
+        direction: SplitDirection,
+        forward: bool,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
+        let Some(tree) = self.active_tab() else {
+            return;
+        };
+        let current = self.focused_pane(window, cx);
+        if let Some(next) = tree.neighbor(current, direction, forward, cx) {
+            self.focus_pane(next, window, cx);
+            cx.notify();
         }
     }
 }
@@ -371,12 +547,16 @@ impl TabsView {
 /// 某个工具栏按钮在本阶段是否可用。
 ///
 /// 纯函数,便于单测:不可用的按钮必须同时满足"不响应点击"与"置灰显示"。
-/// 「拆分视图」依赖分屏(阶段 3)、「查找」依赖搜索栏(阶段 4),这两项尚无
-/// 对应的 BEHAVIOR_SPEC 条目,本阶段一律置灰。
+/// 「拆分视图」已接入(SPLIT-001);「查找」依赖搜索栏(阶段 4),尚无
+/// 对应的 BEHAVIOR_SPEC 条目,置灰。
 pub(crate) fn toolbar_button_enabled(kind: ToolbarButton) -> bool {
     matches!(
         kind,
-        ToolbarButton::NewTab | ToolbarButton::Copy | ToolbarButton::Paste | ToolbarButton::More
+        ToolbarButton::NewTab
+            | ToolbarButton::SplitView
+            | ToolbarButton::Copy
+            | ToolbarButton::Paste
+            | ToolbarButton::More
     )
 }
 
@@ -398,8 +578,11 @@ impl Focusable for TabsView {
     /// 入口在窗口创建后用它把焦点交给当前终端。标签列表为空的瞬间窗口正在关闭,
     /// 此时返回一个临时句柄即可,不应 panic(CODING_STANDARDS.md 第 3 节)。
     fn focus_handle(&self, cx: &App) -> gpui::FocusHandle {
-        match self.active_tab() {
-            Some(tab) => tab.read(cx).focus_handle(cx),
+        // 只在窗口创建后定位焦点用;window 不可得时退回首窗格句柄。
+        // 这里不解析实际焦点窗格(需要 Window),句柄仅作入口占位:
+        // 真正的焦点分配在 focus_active / focus_pane。
+        match self.active_tab().and_then(|tree| tree.leaf_at(0)) {
+            Some(pane) => pane.read(cx).focus_handle(cx),
             None => cx.focus_handle(),
         }
     }
@@ -424,7 +607,8 @@ impl Render for TabsView {
 
         let title = self
             .active_tab()
-            .map(|tab| tab.read(cx).title())
+            .and_then(|tree| tree.leaf_at(0))
+            .map(|pane| pane.read(cx).title())
             .unwrap_or_else(|| SharedString::from(DEFAULT_TAB_TITLE));
 
         let items = self.tab_items(cx);
@@ -665,13 +849,43 @@ impl Render for TabsView {
         // chrome 高度在渲染**之前**通过 defer 同步给激活标签:窗口尺寸变化时靠它
         // 重算网格行数,否则从别的标签切回来会沿用旧行数,最后一行被标签条遮住(WIN-007)。
         // 不在这里直接 update 子实体:渲染期间修改其它实体状态可能触发嵌套更新。
+        //
+        // 多窗格(SPLIT-*):单窗格沿用整块路径;多个窗格时按 pane 树布局,
+        // 并在 defer 里把每个窗格的内容区尺寸回填给对应视图,网格列数才与
+        // 窗格实际宽度一致(SPLIT-004,与 WIN-007 同一原则)。
         let body: AnyElement = match self.active_tab().cloned() {
-            Some(tab) => {
-                let chrome = tab.clone();
+            Some(tree) => {
+                let content_w = layout.0;
+                let content_h = (layout.1 - CHROME_HEIGHT).max(0.0);
+                // chrome 高度对所有窗格生效;多窗格时同时回填每个窗格的内容区
+                // 面积(SPLIT-004):网格列数按窗格实际宽度算,否则第一个窗格
+                // 仍按整块宽度算列,stty size 与可见列数不一致。
+                // 面积算式(leaf_areas)必须与渲染布局一致:每层平分并扣分隔条。
+                let areas = tree.leaf_areas((content_w, content_h), SPLIT_DIVIDER_WIDTH);
+                let multi = tree.leaf_count() > 1;
+                let chrome = tree.clone();
                 cx.defer(move |cx| {
-                    chrome.update(cx, |tab, cx| tab.set_chrome_height(CHROME_HEIGHT, cx));
+                    chrome.update_leaves(cx, |index, tab, cx| {
+                        tab.set_chrome_height(CHROME_HEIGHT, cx);
+                        if multi {
+                            // 面积缺失(树与面积数组错位)时不覆盖:保持上一帧值,
+                            // 下一帧会再对齐;比错误清零更安全。
+                            if let Some(size) = areas.get(index) {
+                                tab.set_content_size(*size, cx);
+                            }
+                        } else {
+                            tab.clear_content_size(cx);
+                        }
+                    });
                 });
-                tab.into_any_element()
+                if multi {
+                    render_pane_tree(&tree)
+                } else {
+                    match tree.leaf_at(0) {
+                        Some(view) => view.into_any_element(),
+                        None => div().into_any_element(),
+                    }
+                }
             }
             None => div().into_any_element(),
         };
@@ -691,10 +905,32 @@ impl Render for TabsView {
             .on_action(cx.listener(|view, _: &NextTab, window, cx| view.next_tab(window, cx)))
             .on_action(cx.listener(|view, _: &PrevTab, window, cx| view.prev_tab(window, cx)))
             // KEY-001/KEY-002:工具栏的「复制」「粘贴」与快捷键走同一条路径。
-            .on_action(cx.listener(|view, _: &CopySelection, _window, cx| view.copy_active(cx)))
+            .on_action(
+                cx.listener(|view, _: &CopySelection, window, cx| view.copy_active(window, cx)),
+            )
             .on_action(
                 cx.listener(|view, _: &PasteClipboard, window, cx| view.paste_active(window, cx)),
             )
+            // SPLIT-001/002/006:拆分、关闭窗格与窗格间焦点移动。
+            .on_action(cx.listener(|view, _: &SplitVertical, window, cx| {
+                view.split_pane(SplitDirection::Vertical, window, cx);
+            }))
+            .on_action(cx.listener(|view, _: &SplitHorizontal, window, cx| {
+                view.split_pane(SplitDirection::Horizontal, window, cx);
+            }))
+            .on_action(cx.listener(|view, _: &ClosePane, window, cx| view.close_pane(window, cx)))
+            .on_action(cx.listener(|view, _: &FocusPaneLeft, window, cx| {
+                view.move_pane_focus(SplitDirection::Horizontal, false, window, cx);
+            }))
+            .on_action(cx.listener(|view, _: &FocusPaneRight, window, cx| {
+                view.move_pane_focus(SplitDirection::Horizontal, true, window, cx);
+            }))
+            .on_action(cx.listener(|view, _: &FocusPaneUp, window, cx| {
+                view.move_pane_focus(SplitDirection::Vertical, false, window, cx);
+            }))
+            .on_action(cx.listener(|view, _: &FocusPaneDown, window, cx| {
+                view.move_pane_focus(SplitDirection::Vertical, true, window, cx);
+            }))
             .flex()
             .flex_col()
             // relative:菜单浮层用绝对定位落在根节点(窗口原点)下,
@@ -723,6 +959,72 @@ impl Render for TabsView {
             // `deferred` 再推迟一次,确保它晚于所有兄弟节点绘制。
             .child(gpui::deferred(menu))
     }
+}
+
+/// 把窗格树渲染为终端内容区(递归)。
+///
+/// 叶子渲染为填满可用区域的终端元素;内部节点按拆分方向排成 flex 行/列,
+/// 子树之间插入分隔条(SPLIT-004)。比例固定 50/50(SPLIT-005,待确认),
+/// 因此渲染不需要携带逐窗格的尺寸/焦点参数;窗格内容区面积由 defer 里的
+/// leaf_areas 统一回填(算式与这里的布局保持一致)。
+///
+/// 不需要任何上下文:叶子只包一层 div,点击回调捕获叶子实体本身。
+fn render_pane_tree(node: &TerminalPaneTree) -> AnyElement {
+    match node {
+        PaneNode::Leaf(view) => {
+            // SPLIT-006:点击窗格把键盘焦点带给它。element 级监听就够:
+            // 点击必然发生在该窗格内;拖选出画布的窗口级监听由 TerminalView
+            // 自己注册(选区扩展需要),两者互不影响。
+            let leaf = view.clone();
+            div()
+                .id("pane-slot")
+                .flex_1()
+                .min_w_0()
+                .min_h_0()
+                .overflow_hidden()
+                .on_mouse_down(MouseButton::Left, move |_event, window, cx| {
+                    leaf.update(cx, |pane, _cx| pane.focus_terminal(window));
+                })
+                .child(view.clone().into_any_element())
+                .into_any_element()
+        }
+        PaneNode::Split {
+            direction,
+            first,
+            second,
+        } => {
+            let mut container = match direction {
+                SplitDirection::Vertical => div().flex().flex_row(),
+                SplitDirection::Horizontal => div().flex().flex_col(),
+            };
+            container = container
+                .size_full()
+                .min_w_0()
+                .min_h_0()
+                .child(render_pane_tree(first))
+                .child(divider_element(*direction))
+                .child(render_pane_tree(second));
+            container.into_any_element()
+        }
+    }
+}
+
+/// 拆分分隔条(SPLIT-004):固定宽度的一窄条,不参与点击(拖动调整是后续任务)。
+fn divider_element(direction: SplitDirection) -> AnyElement {
+    let color = rgb(crate::theme::panes::DIVIDER);
+    let bar = match direction {
+        SplitDirection::Vertical => div()
+            .w(px(SPLIT_DIVIDER_WIDTH))
+            .h_full()
+            .flex_shrink_0()
+            .bg(color),
+        SplitDirection::Horizontal => div()
+            .h(px(SPLIT_DIVIDER_WIDTH))
+            .w_full()
+            .flex_shrink_0()
+            .bg(color),
+    };
+    bar.into_any_element()
 }
 
 pub(crate) fn more_menu_entries() -> Vec<MenuEntry> {
@@ -944,17 +1246,18 @@ mod tests {
         assert_eq!(s.active, 2, "第一个的上一个应是最后一个");
     }
 
-    /// 工具栏:已实现功能的按钮可用,未实现的一律置灰。
+    /// 工具栏:已实现功能的按钮可用,未实现的一律置灰(SPLIT-001 后拆分可用)。
     ///
-    /// 「拆分视图」依赖分屏(阶段 3)、「查找」依赖搜索栏(阶段 4),这两项在本阶段不可用。
+    /// 「拆分视图」已接入(SPLIT-001);「查找」依赖搜索栏(阶段 4),尚无对应规格条目,置灰。
     #[test]
     fn toolbar_buttons_enabled_matches_implemented_features() {
         assert!(toolbar_button_enabled(ToolbarButton::NewTab));
+        // SPLIT-001:拆分视图接入工具栏按钮
+        assert!(toolbar_button_enabled(ToolbarButton::SplitView));
         assert!(toolbar_button_enabled(ToolbarButton::Copy));
         assert!(toolbar_button_enabled(ToolbarButton::Paste));
         assert!(toolbar_button_enabled(ToolbarButton::More));
 
-        assert!(!toolbar_button_enabled(ToolbarButton::SplitView));
         assert!(!toolbar_button_enabled(ToolbarButton::Find));
     }
 

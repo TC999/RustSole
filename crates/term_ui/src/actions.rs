@@ -21,5 +21,19 @@ gpui::actions!(
         CopySelection,
         /// 把系统剪贴板内容粘贴到当前终端(KEY-002)。
         PasteClipboard,
+        /// 垂直拆分当前窗格:原窗格在左,新窗格在右(SPLIT-001)。
+        SplitVertical,
+        /// 水平拆分当前窗格:原窗格在上,新窗格在下(SPLIT-001)。
+        SplitHorizontal,
+        /// 关闭当前焦点所在的窗格;最后一个窗格时关闭整个标签(SPLIT-002)。
+        ClosePane,
+        /// 焦点移到当前窗格左侧的相邻窗格(SPLIT-006)。
+        FocusPaneLeft,
+        /// 焦点移到当前窗格右侧的相邻窗格(SPLIT-006)。
+        FocusPaneRight,
+        /// 焦点移到当前窗格上方的相邻窗格(SPLIT-006)。
+        FocusPaneUp,
+        /// 焦点移到当前窗格下方的相邻窗格(SPLIT-006)。
+        FocusPaneDown,
     ]
 );

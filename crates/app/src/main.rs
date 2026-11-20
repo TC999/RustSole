@@ -9,13 +9,16 @@ use gpui::{
     WindowDecorations, WindowOptions,
 };
 
-use term_ui::actions::{CloseActiveTab, CopySelection, NewTab, NextTab, PasteClipboard, PrevTab};
+use term_ui::actions::{
+    CloseActiveTab, ClosePane, CopySelection, FocusPaneDown, FocusPaneLeft, FocusPaneRight,
+    FocusPaneUp, NewTab, NextTab, PasteClipboard, PrevTab, SplitHorizontal, SplitVertical,
+};
 use term_ui::tabs::TabsView;
 
 const INIT_COLS: u16 = 80;
 const INIT_ROWS: u16 = 24;
 
-/// 注册标签页与复制/粘贴快捷键(KEY-001、KEY-002、KEY-006..KEY-009)。
+/// 注册标签页与复制/粘贴快捷键(KEY-001、KEY-002、KEY-006..KEY-009、SPLIT-001/002/006)。
 ///
 /// 为什么用 `Ctrl+Shift` 而不是裸 `Ctrl+T` / `Ctrl+W`:
 /// gpui 的绑定在 `on_key_down` **之前**匹配(见 gpui 0.2.2 `window.rs:3790` 的
@@ -32,6 +35,17 @@ fn bind_tab_keys(cx: &mut App) {
         // KEY-001/KEY-002:复制与剪贴板粘贴。与工具栏按钮走同一批 Action。
         KeyBinding::new("ctrl-shift-c", CopySelection, Some("TabsRoot")),
         KeyBinding::new("ctrl-shift-v", PasteClipboard, Some("TabsRoot")),
+        // SPLIT-001:拆分窗格。E/O 沿用 Konsole 的传统键位(待用户确认)。
+        KeyBinding::new("ctrl-shift-e", SplitVertical, Some("TabsRoot")),
+        KeyBinding::new("ctrl-shift-o", SplitHorizontal, Some("TabsRoot")),
+        // SPLIT-002:关闭窗格,与 Ctrl+Shift+W(关闭标签)区分开。
+        KeyBinding::new("ctrl-shift-x", ClosePane, Some("TabsRoot")),
+        // SPLIT-006:焦点在窗格间移动;方向键叠加 Ctrl+Shift,
+        // 不与 SEL-005(裸 Shift+方向键扩展选区)和 KEY-005(方向键进终端)冲突。
+        KeyBinding::new("ctrl-shift-left", FocusPaneLeft, Some("TabsRoot")),
+        KeyBinding::new("ctrl-shift-right", FocusPaneRight, Some("TabsRoot")),
+        KeyBinding::new("ctrl-shift-up", FocusPaneUp, Some("TabsRoot")),
+        KeyBinding::new("ctrl-shift-down", FocusPaneDown, Some("TabsRoot")),
     ]);
 }
 

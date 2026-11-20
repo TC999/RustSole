@@ -131,6 +131,9 @@ pub struct TerminalView {
     /// 上方不属于终端内容的像素高度(标签栏)。由 TabsView 在布局时告知,
     /// 网格行数按「客户区高度 - chrome_height」计算(WIN-007)。
     chrome_height: f32,
+    /// 多窗格(SPLIT-*)布局下本窗格的内容区尺寸;None = 单窗格整块路径。
+    /// 由 TabsView 在布局阶段告知,render 时用它做网格同步。
+    pane_size: Option<(f32, f32)>,
     /// 窗口激活状态观察者(首次 render 时注册,见 render 中的说明)。
     activation_subscription: Option<gpui::Subscription>,
     /// 选区缓冲。首次 render 时从全局取共享实例(SEL-007),之后复用。
@@ -196,6 +199,7 @@ impl TerminalView {
             }),
             title: SharedString::from(DEFAULT_TAB_TITLE),
             chrome_height,
+            pane_size: None,
             activation_subscription: None,
             selection_buffer: buffer::shared(cx),
             drag_anchor: None,
@@ -536,12 +540,14 @@ impl TerminalView {
 
     /// 视口尺寸变化时,把字符网格调整为新的 cols/rows,并通知 PTY 与 Term。
     ///
-    /// `size` 是本帧实际可用的客户区尺寸(逻辑像素),由 [`Self::layout_size`] 校正后传入,
-    /// 不一定等于 `window.viewport_size()`。
+    /// `size` 是本帧实际可用的内容区尺寸(逻辑像素,已扣除 chrome 高度;
+    /// 单窗格时由 [`Self::layout_size`] 校正后传入,多窗格时由 TabsView 按
+    /// 窗格所占区域传入),不一定等于 `window.viewport_size()`。
     fn sync_size(&mut self, size: (f32, f32), cx: &mut Context<Self>) {
         let (width, height) = size;
-        // 客户区高度里扣掉标签栏等 chrome:终端网格只占其下方区域(WIN-007)。
-        // 若不扣,最后一行会被 chrome 遮住,且 stty size 比可见行数多。
+        // 多窗格路径传入的 height 已扣除 chrome,这里补回后再统一扣一次,
+        // 两种路径在同一处收口(WIN-007:stty size 必须等于可见行数)。
+        // 单窗格路径行为与原先完全一致。
         let height: f32 = (height - self.chrome_height).max(0.0);
         // 扣掉滚动条轨道宽度与左右半格间隙(列数按终端画布实际可用宽度算,
         // 与 render 中的 pl/pr 内边距共用 columns_for_width,保持一致)
@@ -1053,6 +1059,31 @@ impl TerminalView {
         cx.notify();
     }
 
+    /// 多窗格布局下,由 TabsView 告知本窗格所占的内容区尺寸(SPLIT-004)。
+    ///
+    /// `size` 已是扣除 chrome 与分隔条之后的窗格内容区(逻辑像素,不含滚动条)。
+    /// 本帧 render 用它而不是整块客户区做网格同步,窗格列数才与实际可见宽度
+    /// 一致(与 WIN-007 同一原则:stty size 必须等于可见行列)。
+    /// 单窗格时 TabsView 不调用本方法,走 render 的整块路径。
+    pub fn set_content_size(&mut self, size: (f32, f32), cx: &mut Context<Self>) {
+        let same = self
+            .pane_size
+            .map(|(w, h)| (w - size.0).abs() < 0.5 && (h - size.1).abs() < 0.5)
+            .unwrap_or(false);
+        if same {
+            return;
+        }
+        self.pane_size = Some(size);
+        cx.notify();
+    }
+
+    /// 清除窗格尺寸回退到整块路径(标签从多窗格收缩回单窗格时调用)。
+    pub fn clear_content_size(&mut self, cx: &mut Context<Self>) {
+        if self.pane_size.take().is_some() {
+            cx.notify();
+        }
+    }
+
     /// 这个标签被切换为激活时调用:刷新快照,避免显示切换前的旧画面。
     pub fn refresh_on_activate(&mut self, cx: &mut Context<Self>) {
         self.refresh_snapshot();
@@ -1407,8 +1438,13 @@ impl Render for TerminalView {
         // 先用校正后的客户区尺寸(而不是可能滞后的 viewport_size)同步终端网格,
         // 再用同一个尺寸给根节点显式宽高,保证自绘元素不会被画到窗口外。
         let layout = layout_size(window);
-        // PTY 事件由 spawn_event_loop 的常驻任务驱动重绘;render 只处理视口尺寸变化
-        self.sync_size(layout, cx);
+        // PTY 事件由 spawn_event_loop 的常驻任务驱动重绘;render 只处理视口尺寸变化。
+        // 多窗格布局(SPLIT-004)时 TabsView 已通过 set_content_size 告知窗格内容区,
+        // 宽高补回滚动条与 chrome 后走同一个 sync_size;单窗格保持整块路径。
+        match self.pane_size {
+            Some((w, h)) => self.sync_size((w + SCROLLBAR_WIDTH, h + self.chrome_height), cx),
+            None => self.sync_size(layout, cx),
+        }
         self.measure_cell_width(window);
 
         // 窗口从最小化恢复时,GPUI 那一帧的呈现可能不包含自绘内容,

@@ -25,7 +25,7 @@ use crate::theme::{
 pub enum ToolbarButton {
     /// 新建标签页(等价于标签条上的「+」)。
     NewTab,
-    /// 拆分视图:分屏功能属阶段 3,本阶段置灰不可用。
+    /// 拆分视图:垂直拆分当前窗格(SPLIT-001),原窗格在左、新窗格在右。
     SplitView,
     /// 复制:把当前选区复制到系统剪贴板(KEY-001)。
     Copy,
@@ -42,7 +42,8 @@ pub enum ToolbarButton {
 pub struct ToolbarItem {
     /// 按钮种类。
     pub kind: ToolbarButton,
-    /// 是否可用。不可用的按钮置灰且不响应点击。
+    /// 是否可用。不可用的按钮置灰且不响应点击。可用性由 tabs.rs 的
+    /// `toolbar_button_enabled` 决定(哪个阶段接入哪个功能)。
     pub enabled: bool,
     /// 指针是否悬停在该按钮上(决定高亮)。
     pub hovered: bool,

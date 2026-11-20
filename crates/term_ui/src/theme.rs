@@ -82,6 +82,17 @@ pub mod toolbar {
     pub const LABEL: u32 = 0xc8c8c8;
 }
 
+/// 拆分窗格配色(SPLIT-001/004)。
+///
+/// 分隔条是窗格之间的边界:颜色取窗口底色与滚动条轨道之间的一档,
+/// 既与终端内容区分,又不喧宾夺主。
+pub mod panes {
+    /// 分隔条颜色。
+    pub const DIVIDER: u32 = 0x2a2a2a;
+    /// 焦点所在窗格的分隔条高亮色(帮助辨认键盘输入的去向)。
+    pub const DIVIDER_FOCUSED: u32 = 0x4a6d8c;
+}
+
 /// 弹出菜单配色。菜单是浮在窗口内容之上的层,底色比工具栏更亮,
 /// 与窗口 chrome 区分开,让用户明确"这是浮层不是窗格"。
 pub mod menu {
